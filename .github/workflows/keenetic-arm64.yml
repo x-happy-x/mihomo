@@ -1,0 +1,28 @@
+name: Keenetic arm64
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - Alpha
+    paths:
+      - "scripts/keenetic/**"
+      - ".github/workflows/keenetic-arm64.yml"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
+        with:
+          go-download-base-url: "https://github.com/MetaCubeX/go/releases/download/build"
+          go-version: "1.26"
+          cache: true
+      - name: Build Keenetic arm64 artifact
+        run: ./scripts/keenetic/build.sh
+      - uses: actions/upload-artifact@v7
+        with:
+          name: mihomo-keenetic-arm64
+          path: dist/keenetic/*
+          if-no-files-found: error
