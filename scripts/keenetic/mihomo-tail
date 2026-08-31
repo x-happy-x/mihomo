@@ -1,0 +1,94 @@
+#!/bin/sh
+set -eu
+
+port=${MIHOMO_TAIL_PORT:-11080}
+
+case "$port" in
+    ''|*[!0-9]*)
+        echo "MIHOMO_TAIL_PORT must be a number." >&2
+        exit 2
+        ;;
+esac
+
+[ "$port" -ge 1 ] && [ "$port" -le 65535 ] || {
+    echo "MIHOMO_TAIL_PORT must be between 1 and 65535." >&2
+    exit 2
+}
+
+proxy_url="socks5h://127.0.0.1:$port"
+command_name=${1:-help}
+
+usage() {
+    cat <<'EOF'
+Usage:
+  mihomo-tail env
+  mihomo-tail curl <curl arguments>
+  mihomo-tail git <git arguments>
+  mihomo-tail run <proxy-aware command> [arguments...]
+  mihomo-tail check <URL>
+
+MIHOMO_TAIL_PORT selects the local forced-Tailscale SOCKS listener.
+The default is 11080. DNS is resolved through Mihomo via socks5h.
+EOF
+}
+
+case "$command_name" in
+    env)
+        printf "export ALL_PROXY='%s'\n" "$proxy_url"
+        printf "export HTTP_PROXY='%s'\n" "$proxy_url"
+        printf "export HTTPS_PROXY='%s'\n" "$proxy_url"
+        printf "export all_proxy='%s'\n" "$proxy_url"
+        printf "export http_proxy='%s'\n" "$proxy_url"
+        printf "export https_proxy='%s'\n" "$proxy_url"
+        printf 'unset NO_PROXY no_proxy\n'
+        ;;
+    curl)
+        shift
+        command -v curl >/dev/null 2>&1 || {
+            echo "curl is not installed." >&2
+            exit 1
+        }
+        exec curl --proxy "$proxy_url" "$@"
+        ;;
+    git)
+        shift
+        command -v git >/dev/null 2>&1 || {
+            echo "git is not installed." >&2
+            exit 1
+        }
+        exec git -c "http.proxy=$proxy_url" -c "https.proxy=$proxy_url" "$@"
+        ;;
+    run)
+        shift
+        [ "$#" -gt 0 ] || {
+            usage >&2
+            exit 2
+        }
+        export ALL_PROXY="$proxy_url" HTTP_PROXY="$proxy_url" HTTPS_PROXY="$proxy_url"
+        export all_proxy="$proxy_url" http_proxy="$proxy_url" https_proxy="$proxy_url"
+        unset NO_PROXY no_proxy || true
+        exec "$@"
+        ;;
+    check)
+        shift
+        [ "$#" -eq 1 ] || {
+            usage >&2
+            exit 2
+        }
+        command -v curl >/dev/null 2>&1 || {
+            echo "curl is not installed." >&2
+            exit 1
+        }
+        exec curl --fail --show-error --location \
+            --connect-timeout 10 --max-time 30 \
+            --proxy "$proxy_url" "$1"
+        ;;
+    help|-h|--help)
+        usage
+        ;;
+    *)
+        echo "Unknown command: $command_name" >&2
+        usage >&2
+        exit 2
+        ;;
+esac
