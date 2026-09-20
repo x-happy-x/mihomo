@@ -31,6 +31,8 @@ type OlcRTC struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
+	idleTimeout time.Duration
+
 	mu      sync.Mutex
 	closed  bool
 	session *olcrtcSession // current run, nil when nothing is running
@@ -40,20 +42,38 @@ type OlcRTC struct {
 // reusable: once its run loop returns, the next dial starts a fresh session.
 // That is what lets the outbound recover after the remote side goes away.
 type olcrtcSession struct {
-	ready chan struct{} // closed once the local SOCKS5 listener is accepting
-	done  chan struct{} // closed once the run loop returned
+	ready  chan struct{} // closed once the local SOCKS5 listener is accepting
+	done   chan struct{} // closed once the run loop returned
+	cancel context.CancelFunc
 
 	localAddr atomic.Value // string, the real "127.0.0.1:port" of the listener
+
+	// active counts connections currently tunnelled through this session and
+	// lastUse marks when the last one was opened or closed, so an idle session
+	// can be told apart from a quiet but busy one.
+	active  atomic.Int64
+	lastUse atomic.Int64
 
 	errMu sync.Mutex
 	err   error
 }
 
 func newOlcrtcSession() *olcrtcSession {
-	return &olcrtcSession{
+	session := &olcrtcSession{
 		ready: make(chan struct{}),
 		done:  make(chan struct{}),
 	}
+	session.touch()
+	return session
+}
+
+func (s *olcrtcSession) touch() { s.lastUse.Store(time.Now().UnixNano()) }
+
+func (s *olcrtcSession) idleFor() time.Duration {
+	if s.active.Load() > 0 {
+		return 0
+	}
+	return time.Since(time.Unix(0, s.lastUse.Load()))
 }
 
 func (s *olcrtcSession) setErr(err error) {
@@ -90,6 +110,12 @@ type OlcRTCOption struct {
 
 	ChannelID     string `proxy:"channel-id,omitempty"`
 	ProviderToken string `proxy:"provider-token,omitempty"`
+
+	// IdleTimeout closes the embedded client after it has carried no traffic
+	// for this long, so a proxy left unselected does not keep a WebRTC stack
+	// and a signalling room to itself. Empty or "0" keeps it open forever; the
+	// next dial pays the link setup again.
+	IdleTimeout string `proxy:"idle-timeout,omitempty"`
 }
 
 // currentSession returns the live session, starting a new one when the previous
@@ -138,21 +164,70 @@ func (o *OlcRTC) startSession(session *olcrtcSession) {
 	log.Debugln("[OLCRTC] %s starting (provider=%s transport=%s)", o.Name(), cfg.Provider, cfg.Transport)
 
 	client := olcclient.New(cfg)
+	ctx, cancel := context.WithCancel(o.ctx)
+	session.cancel = cancel
+
+	if o.idleTimeout > 0 {
+		go o.watchIdle(ctx, session)
+	}
 
 	go func() {
 		defer close(session.done)
-		err := client.RunWithAddress(o.ctx, func(actualAddr string) {
+		defer cancel()
+		err := client.RunWithAddress(ctx, func(actualAddr string) {
 			session.localAddr.Store(actualAddr)
 			log.Infoln("[OLCRTC] %s local SOCKS ready: %s", o.Name(), actualAddr)
 			close(session.ready)
 		})
-		if err != nil && o.ctx.Err() == nil {
+		if err != nil && ctx.Err() == nil {
 			session.setErr(err)
 			log.Errorln("[OLCRTC] %s session ended: %v", o.Name(), err)
 			return
 		}
 		log.Debugln("[OLCRTC] %s session ended", o.Name())
 	}()
+}
+
+// watchIdle closes a session that has carried no traffic for idleTimeout. The
+// next dial starts a fresh one, which is the same path a dead session takes.
+func (o *OlcRTC) watchIdle(ctx context.Context, session *olcrtcSession) {
+	// Check a few times per timeout rather than once, so the session is not
+	// kept alive for almost twice as long by unlucky timing.
+	interval := o.idleTimeout / 4
+	if interval < time.Second {
+		interval = time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-session.done:
+			return
+		case <-ticker.C:
+			if session.idleFor() < o.idleTimeout {
+				continue
+			}
+			log.Infoln("[OLCRTC] %s idle for %s, closing session", o.Name(), o.idleTimeout)
+			session.cancel()
+			return
+		}
+	}
+}
+
+// olcrtcConn reports back when a tunnelled connection closes, so the idle
+// watchdog can tell an unused session from a busy one.
+type olcrtcConn struct {
+	net.Conn
+	once    sync.Once
+	release func()
+}
+
+func (c *olcrtcConn) Close() error {
+	c.once.Do(c.release)
+	return c.Conn.Close()
 }
 
 // ensureReady starts a session if needed and waits for its local SOCKS5
@@ -230,6 +305,15 @@ func (o *OlcRTC) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Con
 		return nil, err
 	}
 
+	if o.idleTimeout > 0 {
+		session.active.Add(1)
+		session.touch()
+		c = &olcrtcConn{Conn: c, release: func() {
+			session.active.Add(-1)
+			session.touch()
+		}}
+	}
+
 	return NewConn(c, o), nil
 }
 
@@ -275,6 +359,18 @@ func NewOlcRTC(option OlcRTCOption) (*OlcRTC, error) {
 		return nil, errors.New("olcrtc: encryption-key is required")
 	}
 
+	var idleTimeout time.Duration
+	if option.IdleTimeout != "" {
+		parsed, err := time.ParseDuration(option.IdleTimeout)
+		if err != nil {
+			return nil, fmt.Errorf("olcrtc: invalid idle-timeout %q: %w", option.IdleTimeout, err)
+		}
+		if parsed < 0 {
+			return nil, fmt.Errorf("olcrtc: idle-timeout must not be negative")
+		}
+		idleTimeout = parsed
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 
 	outbound := &OlcRTC{
@@ -290,9 +386,10 @@ func NewOlcRTC(option OlcRTCOption) (*OlcRTC, error) {
 			Prefer:       option.IPVersion,
 			ProviderName: option.ProviderName,
 		}),
-		option: &option,
-		ctx:    ctx,
-		cancel: cancel,
+		option:      &option,
+		ctx:         ctx,
+		cancel:      cancel,
+		idleTimeout: idleTimeout,
 	}
 
 	return outbound, nil
