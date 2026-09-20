@@ -123,6 +123,28 @@ type ProxyInfo struct {
 	DialerProxy  string
 }
 
+// ProxyAdapterWrapper is implemented by adapters that decorate another one.
+// Callers looking for a capability interface on the underlying adapter should
+// unwrap first, since a decorator only promotes the methods of ProxyAdapter.
+type ProxyAdapterWrapper interface {
+	InnerProxyAdapter() ProxyAdapter
+}
+
+// UnwrapProxyAdapter walks decorators until it reaches the real adapter.
+func UnwrapProxyAdapter(adapter ProxyAdapter) ProxyAdapter {
+	for {
+		wrapper, ok := adapter.(ProxyAdapterWrapper)
+		if !ok {
+			return adapter
+		}
+		inner := wrapper.InnerProxyAdapter()
+		if inner == nil {
+			return adapter
+		}
+		adapter = inner
+	}
+}
+
 type ProxyAdapter interface {
 	Name() string
 	Type() AdapterType

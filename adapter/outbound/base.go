@@ -390,6 +390,11 @@ func (p *autoCloseProxyAdapter) Close() error {
 	return p.closeErr
 }
 
+// InnerProxyAdapter implements C.ProxyAdapterWrapper
+func (p *autoCloseProxyAdapter) InnerProxyAdapter() C.ProxyAdapter {
+	return p.ProxyAdapter
+}
+
 func NewAutoCloseProxyAdapter(adapter ProxyAdapter) ProxyAdapter {
 	proxy := &autoCloseProxyAdapter{
 		ProxyAdapter: adapter,

@@ -31,6 +31,8 @@ func proxyRouter() http.Handler {
 		r.Get("/delay", getProxyDelay)
 		r.Put("/", updateProxy)
 		r.Delete("/", unfixedProxy)
+		r.Get("/tailscale", getTailscaleStatus)
+		r.Put("/tailscale/exit-node", updateTailscaleExitNode)
 	})
 	return r
 }
@@ -157,4 +159,63 @@ func unfixedProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	render.Status(r, http.StatusBadRequest)
 	render.JSON(w, r, ErrBadRequest)
+}
+
+// tailscaleAdapter resolves a proxy to its tailnet control surface, replying
+// with a 400 when the proxy is not a Tailscale outbound.
+func tailscaleAdapter(w http.ResponseWriter, r *http.Request) (C.TailscaleAdapter, bool) {
+	proxy := r.Context().Value(CtxKeyProxy).(C.Proxy)
+	adapter, ok := C.UnwrapProxyAdapter(proxy.Adapter()).(C.TailscaleAdapter)
+	if !ok {
+		render.Status(r, http.StatusBadRequest)
+		render.JSON(w, r, newError("Must be a Tailscale proxy"))
+		return nil, false
+	}
+	return adapter, true
+}
+
+func getTailscaleStatus(w http.ResponseWriter, r *http.Request) {
+	adapter, ok := tailscaleAdapter(w, r)
+	if !ok {
+		return
+	}
+
+	// Starting the tailnet backend is slow the first time, so allow for it.
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+
+	status, err := adapter.TailscaleStatus(ctx)
+	if err != nil {
+		render.Status(r, http.StatusServiceUnavailable)
+		render.JSON(w, r, newError(fmt.Sprintf("Tailscale status error: %s", err.Error())))
+		return
+	}
+	render.JSON(w, r, status)
+}
+
+func updateTailscaleExitNode(w http.ResponseWriter, r *http.Request) {
+	req := struct {
+		// ExitNode is an IP, hostname or MagicDNS name; empty clears it.
+		ExitNode string `json:"exitNode"`
+	}{}
+	if err := render.DecodeJSON(r.Body, &req); err != nil {
+		render.Status(r, http.StatusBadRequest)
+		render.JSON(w, r, ErrBadRequest)
+		return
+	}
+
+	adapter, ok := tailscaleAdapter(w, r)
+	if !ok {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+
+	if err := adapter.SetExitNode(ctx, req.ExitNode); err != nil {
+		render.Status(r, http.StatusBadRequest)
+		render.JSON(w, r, newError(fmt.Sprintf("Set exit node error: %s", err.Error())))
+		return
+	}
+	render.NoContent(w, r)
 }

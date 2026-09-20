@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/netip"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -25,6 +26,7 @@ import (
 	"github.com/metacubex/tailscale/envknob"
 	"github.com/metacubex/tailscale/hostinfo"
 	"github.com/metacubex/tailscale/ipn"
+	"github.com/metacubex/tailscale/ipn/ipnstate"
 	"github.com/metacubex/tailscale/net/netmon"
 	"github.com/metacubex/tailscale/tailcfg"
 	"github.com/metacubex/tailscale/tsnet"
@@ -47,6 +49,9 @@ type Tailscale struct {
 	backendInitErr  error
 
 	serverStarted bool
+
+	// exitNodeMu guards option.ExitNode, which SetExitNode mutates at runtime.
+	exitNodeMu sync.Mutex
 
 	unregisterDNSResolver func()
 }
@@ -286,6 +291,16 @@ func (t *Tailscale) applyPrefs(ctx context.Context) error {
 }
 
 func (t *Tailscale) applyExitNodePrefs(ctx context.Context) error {
+	t.exitNodeMu.Lock()
+	node := t.option.ExitNode
+	t.exitNodeMu.Unlock()
+
+	return t.applyExitNode(ctx, node)
+}
+
+// applyExitNode pushes node to the tailnet backend. An empty node clears the
+// exit node, which is what SetExitNodeIP does with an empty string.
+func (t *Tailscale) applyExitNode(ctx context.Context, node string) error {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
@@ -304,7 +319,13 @@ func (t *Tailscale) applyExitNodePrefs(ctx context.Context) error {
 		mp.ExitNodeAllowLANAccess = *t.option.ExitNodeAllowLANAccess
 		mp.ExitNodeAllowLANAccessSet = true
 	}
-	if err = mp.SetExitNodeIP(t.option.ExitNode, status); err != nil {
+	if node == "" {
+		// SetExitNodeIP rejects an empty string, so clear the prefs directly.
+		// The ID has to be cleared too, otherwise a previously resolved node
+		// keeps being used.
+		mp.ClearExitNode()
+		mp.ExitNodeIDSet = true
+	} else if err = mp.SetExitNodeIP(node, status); err != nil {
 		return err
 	}
 	_, err = lc.EditPrefs(ctx, mp)
@@ -475,5 +496,98 @@ func (t *Tailscale) Close() error {
 	if t.server != nil && t.serverStarted { // tsnet.Server.Close() must not be called before or concurrently with Start.
 		return t.server.Close()
 	}
+	return nil
+}
+
+// tailscalePeerView converts an upstream peer status into the trimmed shape the
+// API exposes.
+func tailscalePeerView(peer *ipnstate.PeerStatus) C.TailscalePeer {
+	view := C.TailscalePeer{
+		ID:             string(peer.ID),
+		HostName:       peer.HostName,
+		DNSName:        strings.TrimSuffix(peer.DNSName, "."),
+		OS:             peer.OS,
+		Relay:          peer.Relay,
+		Online:         peer.Online,
+		ExitNode:       peer.ExitNode,
+		ExitNodeOption: peer.ExitNodeOption,
+		RxBytes:        peer.RxBytes,
+		TxBytes:        peer.TxBytes,
+	}
+	for _, ip := range peer.TailscaleIPs {
+		view.IPs = append(view.IPs, ip.String())
+	}
+	if peer.Tags != nil {
+		view.Tags = peer.Tags.AsSlice()
+	}
+	if peer.PrimaryRoutes != nil {
+		for _, route := range peer.PrimaryRoutes.AsSlice() {
+			view.Routes = append(view.Routes, route.String())
+		}
+	}
+	// LastSeen is only meaningful while the node is away.
+	if !peer.Online && !peer.LastSeen.IsZero() {
+		view.LastSeen = peer.LastSeen.Format(time.RFC3339)
+	}
+	return view
+}
+
+// TailscaleStatus implements C.TailscaleAdapter
+func (t *Tailscale) TailscaleStatus(ctx context.Context) (*C.TailscaleStatus, error) {
+	if err := t.ensureStarted(ctx); err != nil {
+		return nil, err
+	}
+	lc, err := t.server.LocalClient()
+	if err != nil {
+		return nil, err
+	}
+	status, err := lc.Status(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	t.exitNodeMu.Lock()
+	configuredExitNode := t.option.ExitNode
+	t.exitNodeMu.Unlock()
+
+	result := &C.TailscaleStatus{
+		BackendState:   status.BackendState,
+		ExitNode:       configuredExitNode,
+		ExitNodeActive: status.ExitNodeStatus != nil,
+		Peers:          make([]C.TailscalePeer, 0, len(status.Peer)),
+	}
+	if status.Self != nil {
+		self := tailscalePeerView(status.Self)
+		self.Self = true
+		result.Self = &self
+	}
+	for _, peer := range status.Peer {
+		result.Peers = append(result.Peers, tailscalePeerView(peer))
+	}
+	// status.Peer is a map, so sort for a stable listing.
+	slices.SortFunc(result.Peers, func(a, b C.TailscalePeer) int {
+		if c := strings.Compare(a.HostName, b.HostName); c != 0 {
+			return c
+		}
+		return strings.Compare(a.ID, b.ID)
+	})
+	return result, nil
+}
+
+// SetExitNode implements C.TailscaleAdapter
+func (t *Tailscale) SetExitNode(ctx context.Context, node string) error {
+	if err := t.ensureStarted(ctx); err != nil {
+		return err
+	}
+
+	t.exitNodeMu.Lock()
+	defer t.exitNodeMu.Unlock()
+
+	if err := t.applyExitNode(ctx, node); err != nil {
+		return err
+	}
+	// Remember it so a later reconnect re-applies the same choice.
+	t.option.ExitNode = node
+	log.Infoln("[Tailscale](%s) exit node set to %q", t.Name(), node)
 	return nil
 }
