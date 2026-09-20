@@ -245,3 +245,70 @@ func TestOlcRTCRestartsAfterSessionFailure(t *testing.T) {
 	default:
 	}
 }
+
+// TestOlcRTCIdleAccounting pins the bookkeeping the idle watchdog relies on: a
+// live connection must keep the session from looking idle, and closing it must
+// release the session again.
+func TestOlcRTCIdleAccounting(t *testing.T) {
+	socksAddr, _ := startEchoSOCKS5(t)
+	o := newTestOlcRTC(t, socksAddr)
+	o.idleTimeout = time.Minute
+
+	o.mu.Lock()
+	session := o.session
+	o.mu.Unlock()
+
+	if got := session.active.Load(); got != 0 {
+		t.Fatalf("active = %d before dialling, want 0", got)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn, err := o.DialContext(ctx, &C.Metadata{NetWork: C.TCP, Host: "example.com", DstPort: 443})
+	if err != nil {
+		t.Fatalf("DialContext: %v", err)
+	}
+
+	if got := session.active.Load(); got != 1 {
+		t.Fatalf("active = %d with one connection open, want 1", got)
+	}
+	if idle := session.idleFor(); idle != 0 {
+		t.Fatalf("idleFor = %v with a connection open, want 0", idle)
+	}
+
+	if err := conn.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	if got := session.active.Load(); got != 0 {
+		t.Fatalf("active = %d after closing, want 0", got)
+	}
+	// idleFor is a clock reading, so let it advance before expecting a value:
+	// right after the close it is legitimately zero.
+	time.Sleep(10 * time.Millisecond)
+	if session.idleFor() == 0 {
+		t.Fatal("idleFor = 0 well after the last connection closed, want it counting")
+	}
+}
+
+// TestOlcRTCIdleWatchdogCloses checks the watchdog actually ends an idle
+// session, which is what frees the WebRTC stack and the signalling room.
+func TestOlcRTCIdleWatchdogCloses(t *testing.T) {
+	socksAddr, _ := startEchoSOCKS5(t)
+	o := newTestOlcRTC(t, socksAddr)
+	o.idleTimeout = 50 * time.Millisecond
+
+	o.mu.Lock()
+	session := o.session
+	o.mu.Unlock()
+
+	ctx, cancel := context.WithCancel(o.ctx)
+	session.cancel = cancel
+	go o.watchIdle(ctx, session)
+
+	select {
+	case <-ctx.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("watchIdle did not close an idle session")
+	}
+}

@@ -2,7 +2,9 @@ package route
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os"
 
 	"github.com/metacubex/mihomo/adapter"
 	"github.com/metacubex/mihomo/common/yaml"
@@ -27,6 +29,8 @@ func proxyProviderRouter() http.Handler {
 		r.Put("/", updateProvider)
 		r.Get("/healthcheck", healthCheckProvider)
 		r.Put("/proxies", replaceProviderProxies)
+		r.Post("/proxies", addProviderProxy)
+		r.Delete("/proxies/{proxyName}", deleteProviderProxy)
 		r.Mount("/", proxyProviderProxyRouter())
 	})
 	return r
@@ -189,45 +193,134 @@ func replaceProviderProxies(w http.ResponseWriter, r *http.Request) {
 	}
 
 	provider := r.Context().Value(CtxKeyProvider).(P.ProxyProvider)
-	if provider.VehicleType() != P.File {
+	_, vehicle, err := fileProviderProxies(provider)
+	if err != nil {
 		render.Status(r, http.StatusBadRequest)
-		render.JSON(w, r, newError("Must be a file-backed provider"))
+		render.JSON(w, r, newError(err.Error()))
 		return
+	}
+	if err = writeFileProviderProxies(provider, vehicle, req.Proxies); err != nil {
+		render.Status(r, http.StatusBadRequest)
+		render.JSON(w, r, newError(err.Error()))
+		return
+	}
+	render.NoContent(w, r)
+}
+
+// fileProviderProxies reads the entries a file-backed provider currently holds.
+// The provider API deliberately does not expose proxy settings, so a caller
+// that only wants to add or remove one entry should not have to send the
+// others back: that would mean reading everyone's credentials first.
+func fileProviderProxies(provider P.ProxyProvider) ([]map[string]any, P.Vehicle, error) {
+	if provider.VehicleType() != P.File {
+		return nil, nil, errors.New("Must be a file-backed provider")
 	}
 	backed, ok := provider.(fileBackedProvider)
 	if !ok {
-		render.Status(r, http.StatusBadRequest)
-		render.JSON(w, r, newError("Provider does not expose its file"))
-		return
+		return nil, nil, errors.New("Provider does not expose its file")
 	}
+	vehicle := backed.Vehicle()
 
-	// Parse every entry before writing anything: a provider left holding a
-	// broken file would keep failing to reload with no way back through the API.
-	for i, mapping := range req.Proxies {
+	buf, err := os.ReadFile(vehicle.Path())
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, vehicle, nil // a provider may legitimately start empty
+		}
+		return nil, nil, err
+	}
+	holder := struct {
+		Proxies []map[string]any `yaml:"proxies"`
+	}{}
+	if err = yaml.Unmarshal(buf, &holder); err != nil {
+		return nil, nil, err
+	}
+	return holder.Proxies, vehicle, nil
+}
+
+// writeFileProviderProxies validates every entry, writes the file and reloads.
+func writeFileProviderProxies(provider P.ProxyProvider, vehicle P.Vehicle, proxies []map[string]any) error {
+	// Validate before writing: a provider left holding a broken file keeps
+	// failing to reload, with no way back through the API.
+	for i, mapping := range proxies {
 		proxy, err := adapter.ParseProxy(mapping)
 		if err != nil {
-			render.Status(r, http.StatusBadRequest)
-			render.JSON(w, r, newError(fmt.Sprintf("proxy %d: %s", i, err.Error())))
-			return
+			return fmt.Errorf("proxy %d: %w", i, err)
 		}
-		// Parsing is only a validity check; nothing should be left running.
 		_ = proxy.Close()
 	}
+	buf, err := yaml.Marshal(map[string]any{"proxies": proxies})
+	if err != nil {
+		return err
+	}
+	if err = vehicle.Write(buf); err != nil {
+		return err
+	}
+	return provider.Update()
+}
 
-	buf, err := yaml.Marshal(map[string]any{"proxies": req.Proxies})
+func addProviderProxy(w http.ResponseWriter, r *http.Request) {
+	proxy := map[string]any{}
+	if err := render.DecodeJSON(r.Body, &proxy); err != nil {
+		render.Status(r, http.StatusBadRequest)
+		render.JSON(w, r, ErrBadRequest)
+		return
+	}
+	name, _ := proxy["name"].(string)
+	if name == "" {
+		render.Status(r, http.StatusBadRequest)
+		render.JSON(w, r, newError("Proxy name is required"))
+		return
+	}
+
+	provider := r.Context().Value(CtxKeyProvider).(P.ProxyProvider)
+	proxies, vehicle, err := fileProviderProxies(provider)
 	if err != nil {
 		render.Status(r, http.StatusBadRequest)
-		render.JSON(w, r, newError(fmt.Sprintf("Marshal error: %s", err.Error())))
+		render.JSON(w, r, newError(err.Error()))
 		return
 	}
-	if err = backed.Vehicle().Write(buf); err != nil {
-		render.Status(r, http.StatusInternalServerError)
-		render.JSON(w, r, newError(fmt.Sprintf("Write error: %s", err.Error())))
+	for _, existing := range proxies {
+		if existingName, _ := existing["name"].(string); existingName == name {
+			render.Status(r, http.StatusBadRequest)
+			render.JSON(w, r, newError(fmt.Sprintf("Proxy %q already exists", name)))
+			return
+		}
+	}
+
+	if err = writeFileProviderProxies(provider, vehicle, append(proxies, proxy)); err != nil {
+		render.Status(r, http.StatusBadRequest)
+		render.JSON(w, r, newError(err.Error()))
 		return
 	}
-	if err = provider.Update(); err != nil {
-		render.Status(r, http.StatusInternalServerError)
-		render.JSON(w, r, newError(fmt.Sprintf("Reload error: %s", err.Error())))
+	render.NoContent(w, r)
+}
+
+func deleteProviderProxy(w http.ResponseWriter, r *http.Request) {
+	name := getEscapeParam(r, "proxyName")
+	provider := r.Context().Value(CtxKeyProvider).(P.ProxyProvider)
+
+	proxies, vehicle, err := fileProviderProxies(provider)
+	if err != nil {
+		render.Status(r, http.StatusBadRequest)
+		render.JSON(w, r, newError(err.Error()))
+		return
+	}
+
+	kept := make([]map[string]any, 0, len(proxies))
+	for _, existing := range proxies {
+		if existingName, _ := existing["name"].(string); existingName != name {
+			kept = append(kept, existing)
+		}
+	}
+	if len(kept) == len(proxies) {
+		render.Status(r, http.StatusNotFound)
+		render.JSON(w, r, ErrNotFound)
+		return
+	}
+
+	if err = writeFileProviderProxies(provider, vehicle, kept); err != nil {
+		render.Status(r, http.StatusBadRequest)
+		render.JSON(w, r, newError(err.Error()))
 		return
 	}
 	render.NoContent(w, r)
