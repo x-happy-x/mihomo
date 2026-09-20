@@ -33,6 +33,7 @@ func proxyRouter() http.Handler {
 		r.Delete("/", unfixedProxy)
 		r.Get("/tailscale", getTailscaleStatus)
 		r.Put("/tailscale/exit-node", updateTailscaleExitNode)
+		r.Put("/tailscale/running", updateTailscaleRunning)
 	})
 	return r
 }
@@ -215,6 +216,32 @@ func updateTailscaleExitNode(w http.ResponseWriter, r *http.Request) {
 	if err := adapter.SetExitNode(ctx, req.ExitNode); err != nil {
 		render.Status(r, http.StatusBadRequest)
 		render.JSON(w, r, newError(fmt.Sprintf("Set exit node error: %s", err.Error())))
+		return
+	}
+	render.NoContent(w, r)
+}
+
+func updateTailscaleRunning(w http.ResponseWriter, r *http.Request) {
+	req := struct {
+		Running *bool `json:"running"`
+	}{}
+	if err := render.DecodeJSON(r.Body, &req); err != nil || req.Running == nil {
+		render.Status(r, http.StatusBadRequest)
+		render.JSON(w, r, ErrBadRequest)
+		return
+	}
+
+	adapter, ok := tailscaleAdapter(w, r)
+	if !ok {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+
+	if err := adapter.SetRunning(ctx, *req.Running); err != nil {
+		render.Status(r, http.StatusBadRequest)
+		render.JSON(w, r, newError(fmt.Sprintf("Set running error: %s", err.Error())))
 		return
 	}
 	render.NoContent(w, r)

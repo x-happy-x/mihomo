@@ -550,8 +550,17 @@ func (t *Tailscale) TailscaleStatus(ctx context.Context) (*C.TailscaleStatus, er
 	configuredExitNode := t.option.ExitNode
 	t.exitNodeMu.Unlock()
 
+	// Prefs carry the administrative on/off switch, which the status alone
+	// only hints at through BackendState.
+	wantRunning := status.BackendState != "Stopped"
+	if prefs, prefsErr := lc.GetPrefs(ctx); prefsErr == nil {
+		wantRunning = prefs.WantRunning
+	}
+
 	result := &C.TailscaleStatus{
 		BackendState:   status.BackendState,
+		AuthURL:        status.AuthURL,
+		WantRunning:    wantRunning,
 		ExitNode:       configuredExitNode,
 		ExitNodeActive: status.ExitNodeStatus != nil,
 		Peers:          make([]C.TailscalePeer, 0, len(status.Peer)),
@@ -572,6 +581,24 @@ func (t *Tailscale) TailscaleStatus(ctx context.Context) (*C.TailscaleStatus, er
 		return strings.Compare(a.ID, b.ID)
 	})
 	return result, nil
+}
+
+// SetRunning implements C.TailscaleAdapter
+func (t *Tailscale) SetRunning(ctx context.Context, running bool) error {
+	if err := t.ensureStarted(ctx); err != nil {
+		return err
+	}
+	lc, err := t.server.LocalClient()
+	if err != nil {
+		return err
+	}
+	mp := &ipn.MaskedPrefs{WantRunningSet: true}
+	mp.WantRunning = running
+	if _, err = lc.EditPrefs(ctx, mp); err != nil {
+		return err
+	}
+	log.Infoln("[Tailscale](%s) want-running set to %v", t.Name(), running)
+	return nil
 }
 
 // SetExitNode implements C.TailscaleAdapter

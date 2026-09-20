@@ -41,12 +41,20 @@ type TailscaleStatus struct {
 
 	Self *TailscalePeer `json:"self,omitempty"`
 
+	// AuthURL is set while the backend needs a login: opening it authorises
+	// this node with the control server. Empty once the node is registered.
+	AuthURL string `json:"authURL,omitempty"`
+
 	// ExitNode is what this outbound is configured to use, empty when none.
 	// It is the value accepted by SetExitNode, not necessarily one in effect.
 	ExitNode string `json:"exitNode"`
 	// ExitNodeActive reports whether traffic is actually leaving through an
 	// exit node right now.
 	ExitNodeActive bool `json:"exitNodeActive"`
+
+	// WantRunning is the tailnet equivalent of `tailscale up` / `down`: false
+	// means the node is administratively stopped and carries no traffic.
+	WantRunning bool `json:"wantRunning"`
 
 	Peers []TailscalePeer `json:"peers"`
 }
@@ -66,4 +74,8 @@ type TailscaleAdapter interface {
 	// a MagicDNS name; an empty string clears the exit node. The change applies
 	// immediately and lasts until the outbound is recreated by a config reload.
 	SetExitNode(ctx context.Context, node string) error
+
+	// SetRunning starts or stops the tailnet node without tearing the outbound
+	// down, the same switch as `tailscale up` and `tailscale down`.
+	SetRunning(ctx context.Context, running bool) error
 }
