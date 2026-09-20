@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/metacubex/mihomo/adapter"
 	"github.com/metacubex/mihomo/common/yaml"
@@ -29,7 +30,9 @@ func proxyProviderRouter() http.Handler {
 		r.Put("/", updateProvider)
 		r.Get("/healthcheck", healthCheckProvider)
 		r.Put("/proxies", replaceProviderProxies)
+		r.Get("/proxies", getProviderProxies)
 		r.Post("/proxies", addProviderProxy)
+		r.Put("/proxies/{proxyName}", updateProviderProxy)
 		r.Delete("/proxies/{proxyName}", deleteProviderProxy)
 		r.Mount("/", proxyProviderProxyRouter())
 	})
@@ -319,6 +322,128 @@ func deleteProviderProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err = writeFileProviderProxies(provider, vehicle, kept); err != nil {
+		render.Status(r, http.StatusBadRequest)
+		render.JSON(w, r, newError(err.Error()))
+		return
+	}
+	render.NoContent(w, r)
+}
+
+// sensitiveProxyFields marks settings that must not leave the core. The match
+// is a substring so "encryption-key", "private-key" and "auth-key" are all
+// covered; over-redacting is harmless here, since an omitted field simply
+// keeps its stored value on the next update.
+var sensitiveProxyFields = []string{"password", "secret", "token", "key", "auth", "uuid", "psk"}
+
+func isSensitiveProxyField(name string) bool {
+	lower := strings.ToLower(name)
+	for _, marker := range sensitiveProxyFields {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// redactProxy drops the settings a caller must not read back. What is left is
+// enough to show an entry in an editor; the parts that are not are merged from
+// the stored copy when the entry is updated.
+func redactProxy(proxy map[string]any) map[string]any {
+	redacted := make(map[string]any, len(proxy))
+	for key, value := range proxy {
+		if isSensitiveProxyField(key) {
+			continue
+		}
+		redacted[key] = value
+	}
+	return redacted
+}
+
+func getProviderProxies(w http.ResponseWriter, r *http.Request) {
+	provider := r.Context().Value(CtxKeyProvider).(P.ProxyProvider)
+	proxies, _, err := fileProviderProxies(provider)
+	if err != nil {
+		render.Status(r, http.StatusBadRequest)
+		render.JSON(w, r, newError(err.Error()))
+		return
+	}
+
+	redacted := make([]map[string]any, 0, len(proxies))
+	for _, proxy := range proxies {
+		redacted = append(redacted, redactProxy(proxy))
+	}
+	render.JSON(w, r, render.M{"proxies": redacted})
+}
+
+// updateProviderProxy merges the given settings into a stored entry. Fields the
+// caller leaves out keep their stored value, which is how an editor changes a
+// transport without ever having seen the encryption key.
+func updateProviderProxy(w http.ResponseWriter, r *http.Request) {
+	patch := map[string]any{}
+	if err := render.DecodeJSON(r.Body, &patch); err != nil {
+		render.Status(r, http.StatusBadRequest)
+		render.JSON(w, r, ErrBadRequest)
+		return
+	}
+
+	name := getEscapeParam(r, "proxyName")
+	provider := r.Context().Value(CtxKeyProvider).(P.ProxyProvider)
+	proxies, vehicle, err := fileProviderProxies(provider)
+	if err != nil {
+		render.Status(r, http.StatusBadRequest)
+		render.JSON(w, r, newError(err.Error()))
+		return
+	}
+
+	index := -1
+	for i, existing := range proxies {
+		if existingName, _ := existing["name"].(string); existingName == name {
+			index = i
+			break
+		}
+	}
+	if index < 0 {
+		render.Status(r, http.StatusNotFound)
+		render.JSON(w, r, ErrNotFound)
+		return
+	}
+
+	merged := make(map[string]any, len(proxies[index])+len(patch))
+	for key, value := range proxies[index] {
+		merged[key] = value
+	}
+	for key, value := range patch {
+		// An empty string means "leave as is": an editor cannot show a redacted
+		// field, so a blank input must not wipe the stored value.
+		if text, ok := value.(string); ok && text == "" {
+			continue
+		}
+		merged[key] = value
+	}
+
+	if newName, _ := merged["name"].(string); newName != name {
+		if newName == "" {
+			render.Status(r, http.StatusBadRequest)
+			render.JSON(w, r, newError("Proxy name is required"))
+			return
+		}
+		for i, existing := range proxies {
+			if i == index {
+				continue
+			}
+			if existingName, _ := existing["name"].(string); existingName == newName {
+				render.Status(r, http.StatusBadRequest)
+				render.JSON(w, r, newError(fmt.Sprintf("Proxy %q already exists", newName)))
+				return
+			}
+		}
+	}
+
+	updated := make([]map[string]any, len(proxies))
+	copy(updated, proxies)
+	updated[index] = merged
+
+	if err = writeFileProviderProxies(provider, vehicle, updated); err != nil {
 		render.Status(r, http.StatusBadRequest)
 		render.JSON(w, r, newError(err.Error()))
 		return
