@@ -54,6 +54,7 @@ const (
 	Tailscale
 	ZeroTier
 	GostRelay
+	OlcRTC
 )
 
 const (
@@ -235,6 +236,8 @@ func (at AdapterType) String() string {
 		return "OpenVPN"
 	case Tailscale:
 		return "Tailscale"
+	case OlcRTC:
+		return "OlcRTC"
 	case ZeroTier:
 		return "ZeroTier"
 	case GostRelay:

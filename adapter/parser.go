@@ -216,6 +216,13 @@ func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error)
 			break
 		}
 		proxy, err = outbound.NewZeroTier(*zeroTierOption)
+	case "olcrtc":
+		olcRTCOption := &outbound.OlcRTCOption{BasicOption: basicOption}
+		err = decoder.Decode(mapping, olcRTCOption)
+		if err != nil {
+			break
+		}
+		proxy, err = outbound.NewOlcRTC(*olcRTCOption)
 	default:
 		return nil, fmt.Errorf("unsupport proxy type: %s", proxyType)
 	}

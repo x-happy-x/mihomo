@@ -1,0 +1,24 @@
+mixed-port: 7890
+allow-lan: false
+mode: rule
+log-level: debug
+external-controller: 127.0.0.1:19090
+
+proxies:
+  - name: OLCRTC-TEST
+    type: olcrtc
+    auth-provider: jitsi
+    transport: datachannel
+    room-id: "https://meet.example.org/REPLACE_WITH_ROOM_NAME"
+    encryption-key: "REPLACE_WITH_64_HEX_CHARS"
+    dns-server: "8.8.8.8:53"
+
+proxy-groups:
+  - name: TEST
+    type: select
+    proxies:
+      - OLCRTC-TEST
+      - DIRECT
+
+rules:
+  - MATCH,TEST
