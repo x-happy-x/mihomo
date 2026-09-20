@@ -331,9 +331,12 @@ func deleteProviderProxy(w http.ResponseWriter, r *http.Request) {
 
 // sensitiveProxyFields marks settings that must not leave the core. The match
 // is a substring so "encryption-key", "private-key" and "auth-key" are all
-// covered; over-redacting is harmless here, since an omitted field simply
-// keeps its stored value on the next update.
-var sensitiveProxyFields = []string{"password", "secret", "token", "key", "auth", "uuid", "psk"}
+// covered by "key" alone.
+//
+// Deliberately not "auth": that would also hide auth-provider, which names the
+// signalling service rather than granting access to it, and an editor needs it
+// to show what an entry is.
+var sensitiveProxyFields = []string{"password", "secret", "token", "key", "uuid", "psk"}
 
 func isSensitiveProxyField(name string) bool {
 	lower := strings.ToLower(name)
