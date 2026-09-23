@@ -26,3 +26,5 @@ test/config/cache*
 /output
 .vscode/
 .fleet/
+# Keenetic build artifacts (scripts/keenetic/build.sh)
+/dist/
