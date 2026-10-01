@@ -1,0 +1,84 @@
+name: Fork release
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: fork-release
+  cancel-in-progress: false
+jobs:
+  test:
+    if: github.repository == 'x-happy-x/mihomo' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - run: go test -race ./adapter/provider ./adapter/outboundgroup ./component/updater ./config ./hub/route
+      - run: go build -tags with_gvisor -o /tmp/mihomo .
+        env:
+          CGO_ENABLED: '0'
+      - run: python3 scripts/test-adaptive-health.py --binary /tmp/mihomo
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - {os: linux, arch: arm64, name: linux-arm64}
+          - {os: linux, arch: arm, arm: '7', name: linux-armv7}
+          - {os: linux, arch: mipsle, mips: softfloat, name: linux-mipsle-softfloat}
+          - {os: linux, arch: mipsle, mips: hardfloat, name: linux-mipsle-hardfloat}
+          - {os: linux, arch: mips, mips: hardfloat, name: linux-mips-hardfloat}
+          - {os: linux, arch: amd64, name: linux-amd64-v1}
+          - {os: windows, arch: amd64, name: windows-amd64-v1}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Build
+        env:
+          CGO_ENABLED: '0'
+          GOOS: ${{ matrix.target.os }}
+          GOARCH: ${{ matrix.target.arch }}
+          GOARM: ${{ matrix.target.arm || '7' }}
+          GOMIPS: ${{ matrix.target.mips || 'softfloat' }}
+          GOAMD64: v1
+        run: |
+          VERSION=v1.19.32-fork.${{ github.run_number }}
+          NAME=mihomo-${{ matrix.target.name }}
+          mkdir release
+          SUFFIX=''
+          if [ "$GOOS" = windows ]; then SUFFIX=.exe; fi
+          go build -trimpath -tags with_gvisor -ldflags "-s -w -X github.com/metacubex/mihomo/constant.Version=$VERSION -X github.com/metacubex/mihomo/constant.BuildTime=$(date -u +%FT%TZ)" -o "$NAME$SUFFIX" .
+          if [ "$GOOS" = windows ]; then
+            zip -j "release/$NAME-$VERSION.zip" "$NAME$SUFFIX"
+          else
+            gzip -c "$NAME" > "release/$NAME-$VERSION.gz"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target.name }}
+          path: release/*
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release
+          merge-multiple: true
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          VERSION=v1.19.32-fork.${{ github.run_number }}
+          printf '%s' "$VERSION" > release/version.txt
+          (cd release && sha256sum *.gz *.zip > sha256sums.txt)
+          gh release create "$VERSION" release/* --target "$GITHUB_SHA" --title "$VERSION" --notes 'Updated upstream plus OLCRTC, Tailscale and adaptive provider health. Both updater channels track this fork release.' --latest
