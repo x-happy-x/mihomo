@@ -110,6 +110,31 @@ func TestAdaptiveModesAndSeparateRankings(t *testing.T) {
 		t.Fatal("return to normal did not restore normal ranking")
 	}
 }
+
+func TestAdaptivePartialConnectivityNeverSelectsNode(t *testing.T) {
+	a, ps, _ := adaptiveFixture(t, 1)
+	a.options.Targets = append(a.options.Targets, AdaptiveTarget{URL: "https://cdn.test", ExpectedStatus: "200"})
+	a.probe = func(ctx context.Context, p C.ProxyAdapter, target AdaptiveTarget) AdaptiveProbeResult {
+		// First node reaches only the CDN; the second reaches both destinations.
+		return AdaptiveProbeResult{URL: target.URL, OK: p == a.direct || p == ps[1] || target.URL == "https://cdn.test", MS: 20}
+	}
+	for range 4 {
+		a.check(context.Background(), ps)
+	}
+	if a.alive(ps[0]) || !a.alive(ps[1]) || a.order(ps)[0] != ps[1] {
+		t.Fatal("partially reachable node became eligible for automatic selection")
+	}
+	if a.records[adaptiveNormal][adaptiveIdentity(ps[0])].stable(time.Now()) {
+		t.Fatal("partial connectivity entered stable history")
+	}
+	a.testProxy(context.Background(), ps[0])
+	if a.alive(ps[0]) {
+		t.Fatal("manual probe accepted partial connectivity")
+	}
+	if adaptiveTargetsOK([]AdaptiveProbeResult{{OK: true}}, 2) || adaptiveTargetsOK(nil, 0) {
+		t.Fatal("missing required probes accepted")
+	}
+}
 func TestAdaptiveStableFirstWithoutStarvation(t *testing.T) {
 	a, ps, _ := adaptiveFixture(t, 1)
 	whitelist := true
