@@ -30,13 +30,15 @@ const (
 // AdaptiveHealthOptions is opt-in and local to a provider. NetworkKey separates
 // history for different uplinks; it is a label, not a network control setting.
 type AdaptiveHealthOptions struct {
-	Enable        bool             `provider:"enable,omitempty" json:"enable"`
-	NetworkKey    string           `provider:"network-key,omitempty" json:"networkKey"`
-	Confirmations int              `provider:"confirmations,omitempty" json:"confirmations"`
-	Concurrency   int              `provider:"concurrency,omitempty" json:"concurrency"`
-	Targets       []AdaptiveTarget `provider:"targets,omitempty" json:"targets"`
-	DirectAllowed []AdaptiveTarget `provider:"direct-allowed,omitempty" json:"directAllowed"`
-	DirectGlobal  []AdaptiveTarget `provider:"direct-global,omitempty" json:"directGlobal"`
+	Enable            bool             `provider:"enable,omitempty" json:"enable"`
+	NetworkKey        string           `provider:"network-key,omitempty" json:"networkKey"`
+	Confirmations     int              `provider:"confirmations,omitempty" json:"confirmations"`
+	Concurrency       int              `provider:"concurrency,omitempty" json:"concurrency"`
+	FailureThreshold  int              `provider:"failure-threshold,omitempty" json:"failureThreshold,omitempty"`
+	RecoveryThreshold int              `provider:"recovery-threshold,omitempty" json:"recoveryThreshold,omitempty"`
+	Targets           []AdaptiveTarget `provider:"targets,omitempty" json:"targets"`
+	DirectAllowed     []AdaptiveTarget `provider:"direct-allowed,omitempty" json:"directAllowed"`
+	DirectGlobal      []AdaptiveTarget `provider:"direct-global,omitempty" json:"directGlobal"`
 }
 
 type AdaptiveRecord struct {
@@ -87,10 +89,13 @@ func (r AdaptiveRecord) record(name string, ok bool, ms int64, now time.Time) Ad
 }
 
 type AdaptiveNodeResult struct {
-	Mode   string                `json:"mode"`
-	At     time.Time             `json:"at"`
-	OK     bool                  `json:"ok"`
-	Probes []AdaptiveProbeResult `json:"probes"`
+	Mode      string                `json:"mode"`
+	At        time.Time             `json:"at"`
+	OK        bool                  `json:"ok"`
+	Available bool                  `json:"available"`
+	Successes int                   `json:"consecutiveSuccesses"`
+	Failures  int                   `json:"consecutiveFailures"`
+	Probes    []AdaptiveProbeResult `json:"probes"`
 }
 
 type AdaptiveNodeSummary struct {
@@ -143,6 +148,15 @@ type adaptiveHealth struct {
 }
 
 func newAdaptiveHealth(name string, options AdaptiveHealthOptions, timeout, interval time.Duration, store adaptiveStore) (*adaptiveHealth, error) {
+	if options.FailureThreshold == 0 {
+		options.FailureThreshold = 1
+	}
+	if options.RecoveryThreshold == 0 {
+		options.RecoveryThreshold = 1
+	}
+	if options.FailureThreshold < 1 || options.FailureThreshold > 10 || options.RecoveryThreshold < 1 || options.RecoveryThreshold > 10 {
+		return nil, fmt.Errorf("adaptive failure/recovery-threshold must be 1..10")
+	}
 	if options.Confirmations == 0 {
 		options.Confirmations = 2
 	}
@@ -181,15 +195,27 @@ func newAdaptiveHealth(name string, options AdaptiveHealthOptions, timeout, inte
 	if interval <= 0 {
 		interval = 300 * time.Second
 	}
+	var probeBudget time.Duration
+	for _, t := range options.Targets {
+		probeBudget += adaptiveTargetTimeout(t, timeout)
+	}
 	// A changed probe policy must not inherit a rating earned under another one.
+	// Keep existing histories when the new, optional thresholds use defaults.
+	policyOptions := options
+	if policyOptions.FailureThreshold == 1 {
+		policyOptions.FailureThreshold = 0
+	}
+	if policyOptions.RecoveryThreshold == 1 {
+		policyOptions.RecoveryThreshold = 0
+	}
 	payload, _ := json.Marshal(struct {
 		Name    string
 		Options AdaptiveHealthOptions
 		Policy  string
-	}{name, options, "all-targets-v2"})
+	}{name, policyOptions, "all-targets-v2"})
 	hash := sha256.Sum256(payload)
 	a := &adaptiveHealth{
-		options: options, timeout: timeout, freshness: max(2*interval, 2*timeout*time.Duration(len(options.Targets))),
+		options: options, timeout: timeout, freshness: max(2*interval, 2*probeBudget),
 		mode: adaptiveUnknown, observed: adaptiveUnknown,
 		records: map[string]map[string]AdaptiveRecord{adaptiveNormal: {}, adaptiveWhitelist: {}}, latest: map[C.Proxy]AdaptiveNodeResult{}, members: map[C.Proxy]bool{},
 		storageKey: "adaptive:" + hex.EncodeToString(hash[:24]), store: store,
@@ -264,17 +290,51 @@ func (a *adaptiveHealth) observe(observed string, now time.Time) string {
 	return a.mode
 }
 
+func adaptiveTargetTimeout(t AdaptiveTarget, fallback time.Duration) time.Duration {
+	if t.Timeout > 0 {
+		return time.Duration(t.Timeout) * time.Millisecond
+	}
+	return fallback
+}
+
+func (a *adaptiveHealth) probeTarget(ctx context.Context, p C.ProxyAdapter, target AdaptiveTarget) AdaptiveProbeResult {
+	probeCtx, cancel := context.WithTimeout(ctx, adaptiveTargetTimeout(target, a.timeout))
+	defer cancel()
+	return a.probe(probeCtx, p, target)
+}
+
 func (a *adaptiveHealth) probeTargets(ctx context.Context, p C.ProxyAdapter, targets []AdaptiveTarget) []AdaptiveProbeResult {
 	results := make([]AdaptiveProbeResult, 0, len(targets))
 	for _, t := range targets {
 		if ctx.Err() != nil {
 			break
 		}
-		probeCtx, cancel := context.WithTimeout(ctx, a.timeout)
-		results = append(results, a.probe(probeCtx, p, t))
-		cancel()
+		results = append(results, a.probeTarget(ctx, p, t))
 	}
 	return results
+}
+
+// Called with mu held. Raw probe results remain visible even while hysteresis
+// retains availability after a transient error. Stale or cross-mode state is
+// never carried forward into a new streak.
+func (a *adaptiveHealth) nodeResult(p C.Proxy, mode string, probes []AdaptiveProbeResult, now time.Time) AdaptiveNodeResult {
+	prev := a.latest[p]
+	if prev.Mode != mode || now.Sub(prev.At) > a.freshness {
+		prev = AdaptiveNodeResult{}
+	}
+	r := AdaptiveNodeResult{Mode: mode, At: now, Probes: probes, OK: adaptiveTargetsOK(probes, len(a.options.Targets)), Available: prev.Available}
+	if r.OK {
+		r.Successes = min(prev.Successes+1, a.options.RecoveryThreshold)
+		if r.Successes >= a.options.RecoveryThreshold {
+			r.Available = true
+		}
+	} else {
+		r.Failures = min(prev.Failures+1, a.options.FailureThreshold)
+		if r.Failures >= a.options.FailureThreshold {
+			r.Available = false
+		}
+	}
+	return r
 }
 
 // A reachable CDN alone does not establish access to all required destinations.
@@ -321,10 +381,9 @@ func (a *adaptiveHealth) check(ctx context.Context, proxies []C.Proxy) {
 			if ctx.Err() != nil {
 				return nil
 			}
-			ok := adaptiveTargetsOK(results, len(a.options.Targets))
 			now := time.Now()
 			a.mu.Lock()
-			a.latest[p] = AdaptiveNodeResult{Mode: scope, At: now, OK: ok, Probes: results}
+			a.latest[p] = a.nodeResult(p, scope, results, now)
 			resultsByProxy[p] = a.latest[p]
 			a.mu.Unlock()
 			a.revision.Add(1)
@@ -448,7 +507,7 @@ func (a *adaptiveHealth) alive(p C.Proxy) bool {
 	defer a.mu.RUnlock()
 	r, ok := a.latest[p]
 	// Rankings survive restarts, but availability must be measured again.
-	return a.members[p] && ok && r.OK && r.Mode != "" && r.Mode == a.mode && a.observed == a.mode &&
+	return a.members[p] && ok && r.Available && r.Mode != "" && r.Mode == a.mode && a.observed == a.mode &&
 		time.Since(r.At) <= a.freshness && time.Since(a.checkedAt) <= a.freshness
 }
 
@@ -463,7 +522,7 @@ func (a *adaptiveHealth) testProxy(ctx context.Context, p C.Proxy) {
 	var wg sync.WaitGroup
 	for i, target := range a.options.Targets {
 		wg.Add(1)
-		go func() { defer wg.Done(); results[i] = a.probe(ctx, p, target) }()
+		go func() { defer wg.Done(); results[i] = a.probeTarget(ctx, p, target) }()
 	}
 	wg.Wait()
 	ok := adaptiveTargetsOK(results, len(a.options.Targets))
@@ -472,7 +531,7 @@ func (a *adaptiveHealth) testProxy(ctx context.Context, p C.Proxy) {
 	}
 	a.mu.Lock()
 	if a.mode == mode && a.observed == observed && a.checkedAt == checkedAt {
-		a.latest[p] = AdaptiveNodeResult{Mode: mode, At: time.Now(), OK: ok, Probes: results}
+		a.latest[p] = a.nodeResult(p, mode, results, time.Now())
 	}
 	a.mu.Unlock()
 	a.revision.Add(1)

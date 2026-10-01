@@ -136,6 +136,8 @@ func (f *Fallback) findAliveProxy(touch bool) C.Proxy {
 	switch {
 	case selected != nil && f.alive(selected):
 		chosen = selected
+	case current != nil && f.inAdaptiveGrace(current):
+		chosen = current
 	case firstAlive != nil:
 		f.selected = ""
 		chosen = firstAlive
@@ -151,6 +153,15 @@ func (f *Fallback) findAliveProxy(touch bool) C.Proxy {
 	}
 	f.current = chosen.Name()
 	return chosen
+}
+
+func (f *Fallback) inAdaptiveGrace(proxy C.Proxy) bool {
+	for _, pd := range f.providers {
+		if adaptive, ok := pd.(interface{ AdaptiveProxyInGrace(C.Proxy) bool }); ok && adaptive.AdaptiveProxyInGrace(proxy) {
+			return true
+		}
+	}
+	return false
 }
 
 func (f *Fallback) alive(proxy C.Proxy) bool {

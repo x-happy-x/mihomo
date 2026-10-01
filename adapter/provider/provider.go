@@ -119,6 +119,21 @@ func (bp *baseProvider) AdaptiveProxyAlive(p C.Proxy) (alive, managed bool) {
 	}
 	return false, false
 }
+
+// AdaptiveProxyInGrace prevents a rank change on a single failed observation
+// from bypassing the configured failure threshold for the current selection.
+func (bp *baseProvider) AdaptiveProxyInGrace(p C.Proxy) bool {
+	a := bp.healthCheck.adaptive
+	if a == nil {
+		return false
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	r, ok := a.latest[p]
+	return a.members[p] && ok && r.Available && !r.OK && r.Mode != "" && r.Mode == a.mode && a.observed == a.mode &&
+		time.Since(r.At) <= a.freshness && time.Since(a.checkedAt) <= a.freshness
+}
+
 func (bp *baseProvider) adaptiveSnapshot() *AdaptiveSnapshot {
 	if bp.healthCheck.adaptive == nil {
 		return nil

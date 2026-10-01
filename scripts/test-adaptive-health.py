@@ -33,6 +33,7 @@ class Origin(QuietHandler):
             code = 204 if state["mode"] == "normal" else 503
             content = b""
         self.send_response(code)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.send_header("Content-Length", str(len(content)))
         self.end_headers()
         if body:
@@ -99,9 +100,12 @@ def run(binary):
                 "interval": 1, "timeout": 500, "lazy": False,
                 "adaptive": {
                     "enable": True, "confirmations": 2, "concurrency": 1,
+                    "failure-threshold": 3, "recovery-threshold": 2,
                     "direct-allowed": [{"url": base + "/allowed", "expected-status": "204"}],
                     "direct-global": [{"url": base + "/global", "expected-status": "204"}],
-                    "targets": [{"url": base + "/payload", "expected-status": "200", "min-bytes": 1024}],
+                    "targets": [{"url": base + "/payload", "expected-status": "200", "min-bytes": 1024,
+                        "timeout": 750, "content-type": "text/plain", "body-regex": "^x+$",
+                        "body-not-regex": "(?i)unsupported_country|challenge"}],
                 },
             },
         }},
@@ -138,7 +142,9 @@ def run(binary):
                     state["mode"] = mode
                     snapshot = wait_for(lambda s: s["mode"] == mode and s["observed"] == mode
                         and s["rankings"][mode][0]["name"] == node
-                        and s["rankings"][mode][0]["stable"], mode)
+                        and s["rankings"][mode][0]["stable"]
+                        and s["results"].get(node, {}).get("mode") == mode
+                        and s["results"][node].get("available", False), mode)
                     assert api("/proxies/TEST")["now"] == node
                     conn = http.client.HTTPConnection("127.0.0.1", mixed, timeout=3)
                     conn.request("GET", base + "/payload")
@@ -159,6 +165,7 @@ def run(binary):
                     stdout=output, stderr=subprocess.STDOUT,
                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
                 restored = wait_for(lambda s: s["mode"] == "normal"
+                    and s["results"].get("normal-node", {}).get("available", False)
                     and any(r["name"] == "whitelist-node" and r["record"]["checks"] >= old_whitelist_checks
                         for r in s["rankings"]["whitelist"]), "persistent inactive-mode history")
                 assert api("/proxies/TEST")["now"] == "normal-node"

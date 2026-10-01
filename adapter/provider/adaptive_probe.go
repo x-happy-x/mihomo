@@ -4,9 +4,11 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"mime"
 	"net"
 	"net/netip"
 	"net/url"
+	"regexp"
 	"strconv"
 	"sync/atomic"
 	"time"
@@ -19,9 +21,15 @@ import (
 
 // AdaptiveTarget describes an actual GET, not a TCP ping or HEAD response.
 type AdaptiveTarget struct {
-	URL            string `provider:"url" json:"url"`
-	ExpectedStatus string `provider:"expected-status,omitempty" json:"expectedStatus"`
-	MinBytes       int64  `provider:"min-bytes,omitempty" json:"minBytes"`
+	URL            string         `provider:"url" json:"url"`
+	ExpectedStatus string         `provider:"expected-status,omitempty" json:"expectedStatus"`
+	MinBytes       int64          `provider:"min-bytes,omitempty" json:"minBytes"`
+	Timeout        int            `provider:"timeout,omitempty" json:"timeout,omitempty"`
+	ContentType    string         `provider:"content-type,omitempty" json:"contentType,omitempty"`
+	BodyRegex      string         `provider:"body-regex,omitempty" json:"bodyRegex,omitempty"`
+	BodyNotRegex   string         `provider:"body-not-regex,omitempty" json:"bodyNotRegex,omitempty"`
+	bodyRE         *regexp.Regexp `provider:"-"`
+	bodyNotRE      *regexp.Regexp `provider:"-"`
 }
 
 type AdaptiveProbeResult struct {
@@ -53,6 +61,32 @@ func validateAdaptiveTargets(targets []AdaptiveTarget) error {
 		if t.MinBytes < 0 || t.MinBytes > 64<<10 {
 			return fmt.Errorf("adaptive min-bytes must be 0..65536")
 		}
+		if t.Timeout < 0 || t.Timeout > 60000 {
+			return fmt.Errorf("adaptive target timeout must be 0..60000 milliseconds")
+		}
+		if t.ContentType != "" {
+			mediaType, params, err := mime.ParseMediaType(t.ContentType)
+			if err != nil || len(params) != 0 || mediaType != t.ContentType {
+				return fmt.Errorf("adaptive content-type must be a media type without parameters")
+			}
+		}
+		for _, pattern := range []struct {
+			text     string
+			compiled **regexp.Regexp
+		}{{t.BodyRegex, &t.bodyRE}, {t.BodyNotRegex, &t.bodyNotRE}} {
+			if len(pattern.text) > 4096 {
+				return fmt.Errorf("adaptive body regex exceeds 4096 bytes")
+			}
+			if pattern.text != "" {
+				re, err := regexp.Compile(pattern.text)
+				if err != nil {
+					return fmt.Errorf("invalid adaptive body regex: %w", err)
+				}
+				*pattern.compiled = re
+			} else {
+				*pattern.compiled = nil
+			}
+		}
 	}
 	return nil
 }
@@ -60,6 +94,11 @@ func validateAdaptiveTargets(targets []AdaptiveTarget) error {
 // probeAdaptive uses this outbound explicitly. It never changes selectors or
 // passes the request back through routing rules. HTTPS verifies certificates.
 func probeAdaptive(ctx context.Context, p C.ProxyAdapter, target AdaptiveTarget) (res AdaptiveProbeResult) {
+	if target.Timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(target.Timeout)*time.Millisecond)
+		defer cancel()
+	}
 	res.URL, res.Stage = target.URL, "dial"
 	started := time.Now()
 	defer func() { res.MS = max(1, time.Since(started).Milliseconds()) }()
@@ -122,16 +161,32 @@ func probeAdaptive(ctx context.Context, p C.ProxyAdapter, target AdaptiveTarget)
 		res.Error = "unexpected HTTP status"
 		return
 	}
+	if target.ContentType != "" {
+		mediaType, _, err := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+		if err != nil || mediaType != target.ContentType {
+			res.Error = "unexpected Content-Type"
+			return
+		}
+	}
 	res.Stage = "body"
 	// EOF is fine for a short complete page. A reset/timeout or insufficient
 	// payload is a failure, unlike the original mobile header-only verdict.
-	res.Bytes, err = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	res.Bytes = int64(len(body))
 	if err != nil {
 		res.Error = "body read failed"
 		return
 	}
 	if res.Bytes < target.MinBytes {
 		res.Error = "body shorter than min-bytes"
+		return
+	}
+	if target.bodyNotRE != nil && target.bodyNotRE.Match(body) {
+		res.Error = "body matched forbidden pattern"
+		return
+	}
+	if target.bodyRE != nil && !target.bodyRE.Match(body) {
+		res.Error = "body did not match required pattern"
 		return
 	}
 	res.OK = true
