@@ -17,12 +17,13 @@ var (
 )
 
 type healthCheckSchema struct {
-	Enable         bool   `provider:"enable"`
-	URL            string `provider:"url,omitempty"`
-	Interval       int    `provider:"interval,omitempty"`
-	TestTimeout    int    `provider:"timeout,omitempty"`
-	Lazy           bool   `provider:"lazy,omitempty"`
-	ExpectedStatus string `provider:"expected-status,omitempty"`
+	Enable         bool                  `provider:"enable"`
+	URL            string                `provider:"url,omitempty"`
+	Interval       int                   `provider:"interval,omitempty"`
+	TestTimeout    int                   `provider:"timeout,omitempty"`
+	Lazy           bool                  `provider:"lazy,omitempty"`
+	ExpectedStatus string                `provider:"expected-status,omitempty"`
+	Adaptive       AdaptiveHealthOptions `provider:"adaptive,omitempty"`
 }
 
 type proxyProviderSchema struct {
@@ -61,6 +62,17 @@ func ParseProxyProvider(name string, mapping map[string]any, tunnel C.Tunnel) (P
 		return nil, err
 	}
 
+	if schema.HealthCheck.Adaptive.Enable {
+		if !schema.HealthCheck.Enable {
+			return nil, fmt.Errorf("adaptive health requires health-check.enable")
+		}
+		if schema.HealthCheck.Interval < 0 || schema.HealthCheck.TestTimeout < 0 {
+			return nil, fmt.Errorf("adaptive interval/timeout cannot be negative")
+		}
+		if schema.HealthCheck.URL == "" {
+			schema.HealthCheck.URL = C.DefaultTestURL
+		}
+	}
 	var hcInterval uint
 	if schema.HealthCheck.Enable {
 		if schema.HealthCheck.Interval == 0 {
@@ -69,6 +81,11 @@ func ParseProxyProvider(name string, mapping map[string]any, tunnel C.Tunnel) (P
 		hcInterval = uint(schema.HealthCheck.Interval)
 	}
 	hc := NewHealthCheck([]C.Proxy{}, schema.HealthCheck.URL, uint(schema.HealthCheck.TestTimeout), hcInterval, schema.HealthCheck.Lazy, expectedStatus)
+
+	if err := hc.configureAdaptive(name, schema.HealthCheck.Adaptive); err != nil {
+		hc.close()
+		return nil, err
+	}
 
 	parser, err := NewProxiesParser(name, tunnel, schema.Filter, schema.ExcludeFilter, schema.ExcludeType, schema.DialerProxy, schema.Override, schema.AgeSecretKey)
 	if err != nil {

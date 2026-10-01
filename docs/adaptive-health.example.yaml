@@ -1,0 +1,29 @@
+# Фрагмент для существующего proxy-providers.ROUTER (не полный конфиг).
+# Нужен бинарник этого форка с MIHOMO-2.
+health-check:
+  enable: true
+  url: https://www.gstatic.com/generate_204
+  expected-status: '204'
+  interval: 60
+  timeout: 5000
+  lazy: false
+  adaptive:
+    enable: true
+    network-key: home-uplink
+    confirmations: 2
+    concurrency: 4
+    direct-allowed:
+      - url: https://ya.ru
+        expected-status: '200-399'
+    direct-global:
+      - url: https://www.gstatic.com/generate_204
+        expected-status: '204'
+      - url: https://cp.cloudflare.com/generate_204
+        expected-status: '204'
+    targets:
+      - url: https://www.google.com/
+        expected-status: '200'
+        min-bytes: 1024
+      - url: https://www.cloudflare.com/cdn-cgi/trace
+        expected-status: '200'
+        min-bytes: 64
