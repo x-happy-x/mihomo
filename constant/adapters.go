@@ -53,6 +53,7 @@ const (
 	OpenVPN
 	Tailscale
 	ZeroTier
+	EasyTier
 	GostRelay
 	OlcRTC
 )
@@ -262,6 +263,8 @@ func (at AdapterType) String() string {
 		return "OlcRTC"
 	case ZeroTier:
 		return "ZeroTier"
+	case EasyTier:
+		return "EasyTier"
 	case GostRelay:
 		return "GostRelay"
 	case Relay:
