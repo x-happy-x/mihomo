@@ -1,5 +1,6 @@
 """Isolated end-to-end adaptive health test; all traffic stays on loopback."""
 import argparse
+import copy
 import http.client
 import http.server
 import json
@@ -112,17 +113,25 @@ def run(binary):
         "proxy-groups": [{"name": "TEST", "type": "fallback", "use": ["lab"], "url": base + "/payload"}],
         "rules": ["MATCH,TEST"],
     }
+    # The service provider reads the same connection configs with display-only
+    # prefixes. Its GET and legacy HEAD must be gated by fresh base admission.
+    service = copy.deepcopy(config["proxy-providers"]["lab"])
+    service["override"] = {"additional-prefix": "AI | "}
+    service["health-check"]["adaptive"]["depends-on"] = "lab"
+    service["health-check"]["adaptive"]["targets"][0]["url"] = base + "/ai"
+    config["proxy-providers"]["ai"] = service
+    config["proxy-groups"].append({"name": "AI", "type": "fallback", "use": ["ai"], "url": base + "/payload"})
     def api(path):
         with urllib.request.urlopen(f"http://127.0.0.1:{controller}" + path, timeout=2) as response:
             return json.load(response)
-    def wait_for(predicate, label):
+    def wait_for(predicate, label, provider="lab"):
         deadline = time.monotonic() + 35
         last = None
         while time.monotonic() < deadline:
             if process.poll() is not None:
                 raise AssertionError("core stopped unexpectedly")
             try:
-                last = api("/providers/proxies/lab")["adaptive"]
+                last = api("/providers/proxies/" + provider)["adaptive"]
                 if predicate(last):
                     return last
             except (OSError, KeyError):
@@ -146,6 +155,17 @@ def run(binary):
                         and s["results"].get(node, {}).get("mode") == mode
                         and s["results"][node].get("available", False), mode)
                     assert api("/proxies/TEST")["now"] == node
+                    service_node = "AI | " + node
+                    skipped_node = "AI | " + ("whitelist-node" if mode == "normal" else "normal-node")
+                    dependent = wait_for(lambda s: s["mode"] == mode and s["observed"] == mode
+                        and s["results"].get(service_node, {}).get("available", False)
+                        and s["results"][service_node]["mode"] == mode
+                        and s["results"].get(skipped_node, {}).get("skipped") == "dependency-not-ready",
+                        "service cascade " + mode, "ai")
+                    assert api("/proxies/AI")["now"] == service_node
+                    assert dependent["dependsOn"] == "lab"
+                    assert next(r["record"]["checks"] for r in dependent["rankings"][mode]
+                        if r["name"] == skipped_node) == 0, "skip polluted service statistics"
                     conn = http.client.HTTPConnection("127.0.0.1", mixed, timeout=3)
                     conn.request("GET", base + "/payload")
                     response = conn.getresponse()
@@ -154,7 +174,8 @@ def run(binary):
                     print(json.dumps({"mode": mode, "selected": node,
                         "normalStable": [r["name"] for r in snapshot["rankings"]["normal"] if r["stable"]],
                         "whitelistStable": [r["name"] for r in snapshot["rankings"]["whitelist"] if r["stable"]],
-                        "proxiedGetBytes": 4096}), flush=True)
+                        "proxiedGetBytes": 4096, "serviceSelected": service_node,
+                        "serviceSkipped": skipped_node, "skippedServiceChecks": 0}), flush=True)
                 assert (root / "cache.db").exists(), "statistics cache missing"
                 old_whitelist_checks = next(r["record"]["checks"] for r in snapshot["rankings"]["whitelist"] if r["name"] == "whitelist-node")
                 # The final normal round has already persisted the whitelist

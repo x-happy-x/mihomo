@@ -36,6 +36,7 @@ type AdaptiveHealthOptions struct {
 	Concurrency       int              `provider:"concurrency,omitempty" json:"concurrency"`
 	FailureThreshold  int              `provider:"failure-threshold,omitempty" json:"failureThreshold,omitempty"`
 	RecoveryThreshold int              `provider:"recovery-threshold,omitempty" json:"recoveryThreshold,omitempty"`
+	DependsOn         string           `provider:"depends-on,omitempty" json:"dependsOn,omitempty"`
 	Targets           []AdaptiveTarget `provider:"targets,omitempty" json:"targets"`
 	DirectAllowed     []AdaptiveTarget `provider:"direct-allowed,omitempty" json:"directAllowed"`
 	DirectGlobal      []AdaptiveTarget `provider:"direct-global,omitempty" json:"directGlobal"`
@@ -95,6 +96,7 @@ type AdaptiveNodeResult struct {
 	Available bool                  `json:"available"`
 	Successes int                   `json:"consecutiveSuccesses"`
 	Failures  int                   `json:"consecutiveFailures"`
+	Skipped   string                `json:"skipped,omitempty"`
 	Probes    []AdaptiveProbeResult `json:"probes"`
 }
 
@@ -107,6 +109,7 @@ type AdaptiveNodeSummary struct {
 }
 
 type AdaptiveSnapshot struct {
+	DependsOn        string                           `json:"dependsOn,omitempty"`
 	Mode             string                           `json:"mode"`
 	Observed         string                           `json:"observed"`
 	Pending          int                              `json:"pending"`
@@ -140,6 +143,8 @@ type adaptiveHealth struct {
 	latest           map[C.Proxy]AdaptiveNodeResult
 	proxies          []C.Proxy
 	members          map[C.Proxy]bool
+	byHealthKey      map[string][]C.Proxy
+	source           *adaptiveHealth
 	store            adaptiveStore
 	storageKey       string
 	persistenceError string
@@ -215,7 +220,9 @@ func newAdaptiveHealth(name string, options AdaptiveHealthOptions, timeout, inte
 	}{name, policyOptions, "all-targets-v2"})
 	hash := sha256.Sum256(payload)
 	a := &adaptiveHealth{
-		options: options, timeout: timeout, freshness: max(2*interval, 2*probeBudget),
+		// singleDo and the scheduler can place adjacent checks just beyond two
+		// intervals. Avoid boundary starvation in dependent checks at 1s cadence.
+		options: options, timeout: timeout, freshness: max(2*interval, 2*probeBudget) + time.Second,
 		mode: adaptiveUnknown, observed: adaptiveUnknown,
 		records: map[string]map[string]AdaptiveRecord{adaptiveNormal: {}, adaptiveWhitelist: {}}, latest: map[C.Proxy]AdaptiveNodeResult{}, members: map[C.Proxy]bool{},
 		storageKey: "adaptive:" + hex.EncodeToString(hash[:24]), store: store,
@@ -362,7 +369,8 @@ func (a *adaptiveHealth) check(ctx context.Context, proxies []C.Proxy) {
 	if ctx.Err() != nil {
 		return
 	}
-	scope := a.observe(adaptiveClassify(allowed, global), time.Now())
+	observed := adaptiveClassify(allowed, global)
+	scope := a.observe(observed, time.Now())
 	a.mu.Lock()
 	a.allowed, a.global = allowed, global
 	a.mu.Unlock()
@@ -377,8 +385,16 @@ func (a *adaptiveHealth) check(ctx context.Context, proxies []C.Proxy) {
 			break
 		}
 		b.Go(func() error {
+			if !a.dependencyAllows(p, observed) {
+				a.skipDependent(p, scope)
+				return nil
+			}
 			results := a.probeTargets(ctx, p, a.options.Targets)
 			if ctx.Err() != nil {
+				return nil
+			}
+			if !a.dependencyAllows(p, observed) {
+				a.skipDependent(p, scope)
 				return nil
 			}
 			now := time.Now()
@@ -415,6 +431,9 @@ func (a *adaptiveHealth) check(ctx context.Context, proxies []C.Proxy) {
 	a.checkedAt = time.Now()
 	if scope != "" {
 		for p, r := range resultsByProxy {
+			if !a.dependencyAllows(p, scope) {
+				continue
+			}
 			r.Mode = scope
 			if latest, exists := a.latest[p]; exists && latest.At == r.At {
 				a.latest[p] = r
@@ -485,8 +504,12 @@ func (a *adaptiveHealth) setProxies(proxies []C.Proxy) {
 	defer a.mu.Unlock()
 	a.proxies = append([]C.Proxy(nil), proxies...)
 	a.members = map[C.Proxy]bool{}
+	a.byHealthKey = map[string][]C.Proxy{}
 	for _, p := range proxies {
 		a.members[p] = true
+		if key := healthProxyKey(p); key != "" {
+			a.byHealthKey[key] = append(a.byHealthKey[key], p)
+		}
 	}
 	for p := range a.latest {
 		if !a.members[p] {
@@ -508,7 +531,7 @@ func (a *adaptiveHealth) alive(p C.Proxy) bool {
 	r, ok := a.latest[p]
 	// Rankings survive restarts, but availability must be measured again.
 	return a.members[p] && ok && r.Available && r.Mode != "" && r.Mode == a.mode && a.observed == a.mode &&
-		time.Since(r.At) <= a.freshness && time.Since(a.checkedAt) <= a.freshness
+		time.Since(r.At) <= a.freshness && time.Since(a.checkedAt) <= a.freshness && a.dependencyAllows(p, a.mode)
 }
 
 func (a *adaptiveHealth) testProxy(ctx context.Context, p C.Proxy) {
@@ -516,6 +539,10 @@ func (a *adaptiveHealth) testProxy(ctx context.Context, p C.Proxy) {
 	mode, observed, checkedAt := a.mode, a.observed, a.checkedAt
 	a.mu.RUnlock()
 	if mode != observed || (mode != adaptiveNormal && mode != adaptiveWhitelist) || time.Since(checkedAt) > a.freshness {
+		return
+	}
+	if !a.dependencyAllows(p, mode) {
+		a.skipDependent(p, mode)
 		return
 	}
 	results := make([]AdaptiveProbeResult, len(a.options.Targets))
@@ -529,6 +556,10 @@ func (a *adaptiveHealth) testProxy(ctx context.Context, p C.Proxy) {
 	if ctx.Err() != nil && !ok {
 		return
 	}
+	if !a.dependencyAllows(p, mode) {
+		a.skipDependent(p, mode)
+		return
+	}
 	a.mu.Lock()
 	if a.mode == mode && a.observed == observed && a.checkedAt == checkedAt {
 		a.latest[p] = a.nodeResult(p, mode, results, time.Now())
@@ -540,7 +571,7 @@ func (a *adaptiveHealth) testProxy(ctx context.Context, p C.Proxy) {
 func (a *adaptiveHealth) snapshot() *AdaptiveSnapshot {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	s := &AdaptiveSnapshot{Mode: a.mode, Observed: a.observed, Pending: a.pending, CheckedAt: a.checkedAt,
+	s := &AdaptiveSnapshot{DependsOn: a.options.DependsOn, Mode: a.mode, Observed: a.observed, Pending: a.pending, CheckedAt: a.checkedAt,
 		DirectAllowed: append([]AdaptiveProbeResult(nil), a.allowed...), DirectGlobal: append([]AdaptiveProbeResult(nil), a.global...),
 		Rankings: map[string][]AdaptiveNodeSummary{}, Results: map[string]AdaptiveNodeResult{}, PersistenceError: a.persistenceError}
 	now := time.Now()

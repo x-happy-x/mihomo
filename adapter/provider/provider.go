@@ -131,7 +131,7 @@ func (bp *baseProvider) AdaptiveProxyInGrace(p C.Proxy) bool {
 	defer a.mu.RUnlock()
 	r, ok := a.latest[p]
 	return a.members[p] && ok && r.Available && !r.OK && r.Mode != "" && r.Mode == a.mode && a.observed == a.mode &&
-		time.Since(r.At) <= a.freshness && time.Since(a.checkedAt) <= a.freshness
+		time.Since(r.At) <= a.freshness && time.Since(a.checkedAt) <= a.freshness && a.dependencyAllows(p, a.mode)
 }
 
 func (bp *baseProvider) adaptiveSnapshot() *AdaptiveSnapshot {
@@ -504,6 +504,10 @@ func NewProxiesParser(pdName string, tunnel C.Tunnel, filter string, excludeFilt
 				proxy, err := adapter.ParseProxy(mapping, adapter.WithTunnelForAPI(tunnel), adapter.WithProviderName(pdName))
 				if err != nil {
 					return nil, fmt.Errorf("proxy %d error: %w", idx, err)
+				}
+				proxy, err = identifyHealthProxy(proxy, mapping)
+				if err != nil {
+					return nil, fmt.Errorf("proxy %d: %w", idx, err)
 				}
 
 				proxiesSet[name] = struct{}{}
