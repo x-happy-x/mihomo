@@ -185,7 +185,8 @@ func newAdaptiveHealth(name string, options AdaptiveHealthOptions, timeout, inte
 	payload, _ := json.Marshal(struct {
 		Name    string
 		Options AdaptiveHealthOptions
-	}{name, options})
+		Policy  string
+	}{name, options, "all-targets-v2"})
 	hash := sha256.Sum256(payload)
 	a := &adaptiveHealth{
 		options: options, timeout: timeout, freshness: max(2*interval, 2*timeout*time.Duration(len(options.Targets))),
@@ -276,6 +277,20 @@ func (a *adaptiveHealth) probeTargets(ctx context.Context, p C.ProxyAdapter, tar
 	return results
 }
 
+// A reachable CDN alone does not establish access to all required destinations.
+// Missing/cancelled probes must not turn partial connectivity into a healthy node.
+func adaptiveTargetsOK(results []AdaptiveProbeResult, expected int) bool {
+	if expected == 0 || len(results) != expected {
+		return false
+	}
+	for _, result := range results {
+		if !result.OK {
+			return false
+		}
+	}
+	return true
+}
+
 func (a *adaptiveHealth) check(ctx context.Context, proxies []C.Proxy) {
 	a.runMu.Lock()
 	defer a.runMu.Unlock()
@@ -306,12 +321,7 @@ func (a *adaptiveHealth) check(ctx context.Context, proxies []C.Proxy) {
 			if ctx.Err() != nil {
 				return nil
 			}
-			ok := false
-			for _, r := range results {
-				if r.OK {
-					ok = true
-				}
-			}
+			ok := adaptiveTargetsOK(results, len(a.options.Targets))
 			now := time.Now()
 			a.mu.Lock()
 			a.latest[p] = AdaptiveNodeResult{Mode: scope, At: now, OK: ok, Probes: results}
@@ -448,10 +458,7 @@ func (a *adaptiveHealth) testProxy(ctx context.Context, p C.Proxy) {
 		go func() { defer wg.Done(); results[i] = a.probe(ctx, p, target) }()
 	}
 	wg.Wait()
-	ok := false
-	for _, r := range results {
-		ok = ok || r.OK
-	}
+	ok := adaptiveTargetsOK(results, len(a.options.Targets))
 	if ctx.Err() != nil && !ok {
 		return
 	}
