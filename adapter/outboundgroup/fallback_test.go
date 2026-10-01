@@ -236,6 +236,23 @@ type adaptiveFallbackProvider struct {
 	P.ProxyProvider
 	status      map[C.Proxy]bool
 	manualTests int
+	grace       map[C.Proxy]bool
+}
+
+func (p *adaptiveFallbackProvider) AdaptiveProxyInGrace(proxy C.Proxy) bool { return p.grace[proxy] }
+
+func TestFallbackRetainsCurrentDuringAdaptiveGrace(t *testing.T) {
+	f, a, b := fallbackFixture(t)
+	pd := &adaptiveFallbackProvider{ProxyProvider: f.providers[0], status: map[C.Proxy]bool{a: false, b: true}, grace: map[C.Proxy]bool{}}
+	f.providers = []P.ProxyProvider{pd}
+	assertNow(t, f, b.name)
+	// An earlier-ranked candidate recovers while the current node has a raw
+	// failure but has not yet reached the configured failure threshold.
+	pd.status[a] = true
+	pd.grace[b] = true
+	assertNow(t, f, b.name)
+	pd.grace[b], pd.status[b] = false, false
+	assertNow(t, f, a.name)
 }
 
 func (p *adaptiveFallbackProvider) AdaptiveProxyAlive(proxy C.Proxy) (bool, bool) {

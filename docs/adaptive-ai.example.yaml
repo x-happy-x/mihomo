@@ -1,0 +1,62 @@
+# Фрагмент, не готовая замена рабочего конфига. Нужна версия с MIHOMO-5.
+# Создайте файл providers/ai-nodes.yaml с payload вида proxies: [...].
+# Можно указать существующий файл провайдера; учитывайте его формат/обновление.
+# Проверяйте небольшой список кандидатов, чтобы не опрашивать всю подписку
+# отдельно для каждого ИИ-сервиса.
+proxy-providers:
+  AI-CHATGPT:
+    type: file
+    path: ./providers/ai-nodes.yaml
+    override:
+      additional-prefix: 'AI-ChatGPT | '
+    health-check:
+      enable: true
+      lazy: false
+      interval: 300       # секунды между запусками; долгий обход не перекрывается
+      timeout: 5000       # мс, по умолчанию для каждой цели
+      url: https://www.gstatic.com/generate_204  # только штатная HEAD-история
+      expected-status: '204'
+      adaptive:
+        enable: true
+        network-key: home-uplink
+        confirmations: 2  # подтверждения режима сети
+        concurrency: 2
+        failure-threshold: 3   # ошибки подряд до признания узла недоступным
+        recovery-threshold: 2  # успехи подряд до признания доступным
+        direct-allowed:
+          - url: https://ya.ru
+            expected-status: '200-399'
+        direct-global:
+          - url: https://www.gstatic.com/generate_204
+            expected-status: '204'
+          - url: https://cp.cloudflare.com/generate_204
+            expected-status: '204'
+        targets:
+          # Начальный пример проверки веб-страницы, НЕ доказательство работы
+          # чата/аккаунта. Сначала сверить ответы через рабочий и плохой VPN.
+          # Маркеры и коды могут меняться; универсального AI health endpoint нет.
+          - url: https://chatgpt.com/
+            timeout: 8000  # переопределяет 5000, но не дедлайн ручной проверки
+            expected-status: '200'
+            content-type: text/html
+            min-bytes: 1024
+            body-regex: '(?i)chatgpt'
+            body-not-regex: '(?i)(cf-chl-|just a moment|unsupported_country|access denied)'
+
+proxy-groups:
+  - name: AI-ChatGPT
+    type: fallback
+    use: [AI-CHATGPT]
+    url: https://www.gstatic.com/generate_204
+    expected-status: '204'
+    timeout: 10000  # общий дедлайн ручного теста; не меньше target.timeout
+
+# Добавьте нужные правила ПЕРЕД общими прокси-правилами/MATCH.
+# Это примеры двух доменов, не полный список зависимостей сервиса.
+rules:
+  - DOMAIN-SUFFIX,chatgpt.com,AI-ChatGPT
+  - DOMAIN-SUFFIX,openai.com,AI-ChatGPT
+
+# Для Claude/Gemini создайте отдельные именованные провайдеры и группы,
+# задайте их targets и уникальные additional-prefix. Не помещайте проверки
+# всех ИИ в общий ROUTER: тогда отказ одного сервиса повлияет на весь трафик.
