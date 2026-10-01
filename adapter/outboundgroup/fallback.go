@@ -4,6 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"net/url"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/metacubex/mihomo/common/callback"
@@ -13,14 +17,19 @@ import (
 	P "github.com/metacubex/mihomo/constant/provider"
 )
 
-type FallbackOption struct{}
+type FallbackOption struct {
+	HealthCheckURLs []string `group:"health-check-urls,omitempty"`
+}
 
 type Fallback struct {
 	*GroupBase
-	disableUDP     bool
-	testUrl        string
-	selected       string
-	expectedStatus string
+	disableUDP      bool
+	testUrl         string
+	selected        string
+	expectedStatus  string
+	stateMu         sync.Mutex
+	current         string
+	healthCheckURLs []string
 }
 
 func (f *Fallback) Now() string {
@@ -83,16 +92,21 @@ func (f *Fallback) MarshalJSON() ([]byte, error) {
 	for _, proxy := range f.GetProxies(false) {
 		all = append(all, proxy.Name())
 	}
+	now := f.Now()
+	f.stateMu.Lock()
+	selected := f.selected
+	f.stateMu.Unlock()
 	return json.Marshal(map[string]any{
-		"type":           f.Type().String(),
-		"now":            f.Now(),
-		"all":            all,
-		"testUrl":        f.testUrl,
-		"expectedStatus": f.expectedStatus,
-		"fixed":          f.selected,
-		"hidden":         f.Hidden(),
-		"icon":           f.Icon(),
-		"emptyFallback":  f.EmptyFallback().Name(),
+		"type":            f.Type().String(),
+		"now":             now,
+		"all":             all,
+		"testUrl":         f.testUrl,
+		"expectedStatus":  f.expectedStatus,
+		"fixed":           selected,
+		"healthCheckUrls": f.healthCheckURLs,
+		"hidden":          f.Hidden(),
+		"icon":            f.Icon(),
+		"emptyFallback":   f.EmptyFallback().Name(),
 	})
 }
 
@@ -104,23 +118,53 @@ func (f *Fallback) Unwrap(metadata *C.Metadata, touch bool) C.Proxy {
 
 func (f *Fallback) findAliveProxy(touch bool) C.Proxy {
 	proxies := f.GetProxies(touch)
+	f.stateMu.Lock()
+	defer f.stateMu.Unlock()
+	var selected, current, firstAlive C.Proxy
 	for _, proxy := range proxies {
-		if len(f.selected) == 0 {
-			if proxy.AliveForTestUrl(f.testUrl) {
-				return proxy
-			}
-		} else {
-			if proxy.Name() == f.selected {
-				if proxy.AliveForTestUrl(f.testUrl) {
-					return proxy
-				} else {
-					f.selected = ""
-				}
-			}
+		if proxy.Name() == f.selected {
+			selected = proxy
+		}
+		if proxy.Name() == f.current {
+			current = proxy
+		}
+		if firstAlive == nil && f.alive(proxy) {
+			firstAlive = proxy
 		}
 	}
+	var chosen C.Proxy
+	switch {
+	case selected != nil && f.alive(selected):
+		chosen = selected
+	case firstAlive != nil:
+		f.selected = ""
+		chosen = firstAlive
+	case selected != nil:
+		// Failure of a test endpoint does not prove the tunnel is unusable.
+		chosen = selected
+	case current != nil:
+		f.selected = ""
+		chosen = current
+	default:
+		f.selected = ""
+		chosen = proxies[0]
+	}
+	f.current = chosen.Name()
+	return chosen
+}
 
-	return proxies[0]
+func (f *Fallback) alive(proxy C.Proxy) bool {
+	if proxy.AliveForTestUrl(f.testUrl) {
+		return true
+	}
+	states := proxy.ExtraDelayHistories()
+	for _, url := range f.healthCheckURLs {
+		// Unknown URLs inherit global liveness; require an actual test result.
+		if state, ok := states[url]; ok && len(state.History) > 0 && state.Alive {
+			return true
+		}
+	}
+	return false
 }
 
 func (f *Fallback) Set(name string) error {
@@ -136,18 +180,28 @@ func (f *Fallback) Set(name string) error {
 		return errors.New("proxy not exist")
 	}
 
-	f.selected = name
-	if !p.AliveForTestUrl(f.testUrl) {
-		ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*time.Duration(5000))
-		defer cancel()
+	if !f.alive(p) {
 		expectedStatus, _ := utils.NewUnsignedRanges[uint16](f.expectedStatus)
-		_, _ = p.URLTest(ctx, f.testUrl, expectedStatus)
+		ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*time.Duration(f.testTimeout))
+		defer cancel()
+		var wg sync.WaitGroup
+		for _, url := range append([]string{f.testUrl}, f.healthCheckURLs...) {
+			wg.Add(1)
+			go func(url string) {
+				defer wg.Done()
+				_, _ = p.URLTest(ctx, url, expectedStatus)
+			}(url)
+		}
+		wg.Wait()
 	}
+	f.ForceSet(name)
 
 	return nil
 }
 
 func (f *Fallback) ForceSet(name string) {
+	f.stateMu.Lock()
+	defer f.stateMu.Unlock()
 	f.selected = name
 }
 
@@ -160,6 +214,40 @@ func (f *Fallback) Proxies() []C.Proxy {
 }
 
 func NewFallback(option GroupCommonOption, fallbackOption FallbackOption, emptyFallback C.Proxy, providers []P.ProxyProvider) (*Fallback, error) {
+	if len(fallbackOption.HealthCheckURLs) > 4 {
+		return nil, fmt.Errorf("fallback %s: at most 4 additional health-check URLs are allowed", option.Name)
+	}
+	urls := make([]string, 0, len(fallbackOption.HealthCheckURLs))
+	seen := map[string]bool{option.URL: true}
+	for _, raw := range fallbackOption.HealthCheckURLs {
+		u := strings.TrimSpace(raw)
+		parsed, err := url.Parse(u)
+		if err != nil || parsed.Host == "" || (parsed.Scheme != "https" && parsed.Scheme != "http") {
+			return nil, fmt.Errorf("fallback %s: invalid health-check URL %q", option.Name, raw)
+		}
+		if !seen[u] {
+			urls = append(urls, u)
+			seen[u] = true
+		}
+	}
+	expectedStatus, err := utils.NewUnsignedRanges[uint16](option.ExpectedStatus)
+	if err != nil {
+		return nil, err
+	}
+	interval := option.Interval
+	if interval <= 0 {
+		interval = 300
+	}
+	for _, u := range urls {
+		for _, pd := range providers {
+			filter := option.Filter
+			if pd.VehicleType() == P.Compatible {
+				filter = ""
+			}
+			pd.RegisterHealthCheckTask(u, expectedStatus, filter, uint(interval))
+		}
+	}
+
 	return &Fallback{
 		GroupBase: NewGroupBase(GroupBaseOption{
 			Name:           option.Name,
@@ -174,8 +262,9 @@ func NewFallback(option GroupCommonOption, fallbackOption FallbackOption, emptyF
 			EmptyFallback:  emptyFallback,
 			Providers:      providers,
 		}),
-		disableUDP:     option.DisableUDP,
-		testUrl:        option.URL,
-		expectedStatus: option.ExpectedStatus,
+		disableUDP:      option.DisableUDP,
+		testUrl:         option.URL,
+		expectedStatus:  option.ExpectedStatus,
+		healthCheckURLs: urls,
 	}, nil
 }
