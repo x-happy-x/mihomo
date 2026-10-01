@@ -68,7 +68,7 @@ func fakeAdaptiveProbe(a *adaptiveHealth, whitelist *bool, order *[]string) adap
 	}
 }
 func TestAdaptiveModesAndSeparateRankings(t *testing.T) {
-	a, ps, _ := adaptiveFixture(t, 2)
+	a, ps, _ := adaptiveFixture(t, 3)
 	whitelist := false
 	a.probe = fakeAdaptiveProbe(a, &whitelist, nil)
 	a.check(context.Background(), ps)
@@ -108,6 +108,22 @@ func TestAdaptiveModesAndSeparateRankings(t *testing.T) {
 	a.check(context.Background(), ps)
 	if a.order(ps)[0] != ps[0] {
 		t.Fatal("return to normal did not restore normal ranking")
+	}
+}
+
+func TestAdaptiveFirstBatchWithMatchingControlsIsRecorded(t *testing.T) {
+	a, ps, _ := adaptiveFixture(t, 2)
+	whitelist := true
+	a.probe = fakeAdaptiveProbe(a, &whitelist, nil)
+	a.check(context.Background(), ps)
+	if a.mode != adaptiveWhitelist || !a.alive(ps[1]) {
+		t.Fatal("matching start/end controls did not confirm first batch")
+	}
+	if a.records[adaptiveWhitelist][adaptiveIdentity(ps[1])].Checks != 1 {
+		t.Fatal("first confirmed batch was discarded")
+	}
+	if a.latest[ps[1]].Mode != adaptiveWhitelist {
+		t.Fatal("live result was left in pending mode")
 	}
 }
 

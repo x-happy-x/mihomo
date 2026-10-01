@@ -346,12 +346,20 @@ func (a *adaptiveHealth) check(ctx context.Context, proxies []C.Proxy) {
 	if endMode != adaptiveClassify(allowed, global) {
 		a.observe(endMode, time.Now())
 		scope = ""
+	} else {
+		// The controls at both ends are independent observations. A confirmed
+		// first batch need not be discarded until the next full provider scan.
+		scope = a.observe(endMode, time.Now())
 	}
 	a.mu.Lock()
 	a.allowed, a.global = endAllowed, endGlobal
 	a.checkedAt = time.Now()
 	if scope != "" {
 		for p, r := range resultsByProxy {
+			r.Mode = scope
+			if latest, exists := a.latest[p]; exists && latest.At == r.At {
+				a.latest[p] = r
+			}
 			var ms int64
 			for _, probe := range r.Probes {
 				if probe.OK && (ms == 0 || probe.MS < ms) {
