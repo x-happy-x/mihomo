@@ -24,16 +24,15 @@ import (
 )
 
 const (
-	baseReleaseURL    = "https://github.com/MetaCubeX/mihomo/releases/latest/download/"
-	versionReleaseURL = "https://github.com/MetaCubeX/mihomo/releases/latest/download/version.txt"
+	baseReleaseURL    = "https://github.com/x-happy-x/mihomo/releases/latest/download/"
+	versionReleaseURL = "https://github.com/x-happy-x/mihomo/releases/latest/download/version.txt"
 
-	baseAlphaURL    = "https://github.com/MetaCubeX/mihomo/releases/download/Prerelease-Alpha/"
-	versionAlphaURL = "https://github.com/MetaCubeX/mihomo/releases/download/Prerelease-Alpha/version.txt"
+	baseAlphaURL    = "https://github.com/x-happy-x/mihomo/releases/latest/download/"
+	versionAlphaURL = "https://github.com/x-happy-x/mihomo/releases/latest/download/version.txt"
 
 	// MaxPackageFileSize is a maximum package file length in bytes. The largest
-	// package whose size is limited by this constant currently has the size of
-	// approximately 32 MiB.
-	MaxPackageFileSize = 32 * 1024 * 1024
+	// fork packages include Tailscale and require more room than upstream.
+	MaxPackageFileSize = 128 * 1024 * 1024
 )
 
 const (

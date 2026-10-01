@@ -66,7 +66,7 @@ func NewUiUpdater(externalUI, externalUIURL, externalUIName string) *UIUpdater {
 	}
 
 	if externalUIURL != "" {
-		updater.externalUIURL = externalUIURL
+		updater.externalUIURL = forkUIURL(externalUIURL)
 	}
 	return updater
 }
@@ -378,4 +378,16 @@ func inDest(fpath, dest string) bool {
 		}
 	}
 	return false
+}
+
+// Migrate the two rolling upstream Zashboard URLs used by existing installs.
+// Pinned releases and arbitrary custom dashboards retain their configured URL.
+func forkUIURL(raw string) string {
+	switch raw {
+	case "https://github.com/Zephyruso/zashboard/releases/latest/download/dist.zip",
+		"https://github.com/Zephyruso/zashboard/releases/latest/download/dist-cdn-fonts.zip":
+		return strings.Replace(raw, "/Zephyruso/", "/x-happy-x/", 1)
+	default:
+		return raw
+	}
 }
