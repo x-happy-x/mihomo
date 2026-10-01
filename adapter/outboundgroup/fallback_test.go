@@ -231,3 +231,38 @@ func TestFallbackRealHTTPStatusChecks(t *testing.T) {
 		t.Fatal("secondary 204 should keep the proxy eligible")
 	}
 }
+
+type adaptiveFallbackProvider struct {
+	P.ProxyProvider
+	status      map[C.Proxy]bool
+	manualTests int
+}
+
+func (p *adaptiveFallbackProvider) AdaptiveProxyAlive(proxy C.Proxy) (bool, bool) {
+	value, exists := p.status[proxy]
+	return value, exists
+}
+func (p *adaptiveFallbackProvider) TestAdaptiveProxy(ctx context.Context, proxy C.Proxy) bool {
+	if _, exists := p.status[proxy]; !exists {
+		return false
+	}
+	p.manualTests++
+	p.status[proxy] = true
+	return true
+}
+func TestFallbackUsesAdaptiveReachabilityAndManualProbe(t *testing.T) {
+	f, a, b := fallbackFixture(t)
+	a.state(f.testUrl, true) // HEAD succeeds, real GET does not.
+	pd := &adaptiveFallbackProvider{ProxyProvider: f.providers[0], status: map[C.Proxy]bool{a: false, b: true}}
+	f.providers = []P.ProxyProvider{pd}
+	assertNow(t, f, b.name)
+	if err := f.Set(a.name); err != nil {
+		t.Fatal(err)
+	}
+	if pd.manualTests != 1 {
+		t.Fatal("manual selection did not run the adaptive probe")
+	}
+	assertNow(t, f, a.name)
+	pd.status[a], pd.status[b] = false, false
+	assertNow(t, f, a.name)
+}

@@ -154,6 +154,13 @@ func (f *Fallback) findAliveProxy(touch bool) C.Proxy {
 }
 
 func (f *Fallback) alive(proxy C.Proxy) bool {
+	for _, pd := range f.providers {
+		if adaptive, ok := pd.(interface{ AdaptiveProxyAlive(C.Proxy) (bool, bool) }); ok {
+			if alive, managed := adaptive.AdaptiveProxyAlive(proxy); managed {
+				return alive
+			}
+		}
+	}
 	if proxy.AliveForTestUrl(f.testUrl) {
 		return true
 	}
@@ -178,6 +185,19 @@ func (f *Fallback) Set(name string) error {
 
 	if p == nil {
 		return errors.New("proxy not exist")
+	}
+	for _, pd := range f.providers {
+		if adaptive, ok := pd.(interface {
+			TestAdaptiveProxy(context.Context, C.Proxy) bool
+		}); ok {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*time.Duration(f.testTimeout))
+			handled := adaptive.TestAdaptiveProxy(ctx, p)
+			cancel()
+			if handled {
+				f.ForceSet(name)
+				return nil
+			}
+		}
 	}
 
 	if !f.alive(p) {

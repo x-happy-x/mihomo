@@ -1,6 +1,7 @@
 package provider
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -41,6 +42,7 @@ type providerForApi struct {
 	ExpectedStatus   string            `json:"expectedStatus"`
 	UpdatedAt        time.Time         `json:"updatedAt,omitempty"`
 	SubscriptionInfo *SubscriptionInfo `json:"subscriptionInfo,omitempty"`
+	Adaptive         *AdaptiveSnapshot `json:"adaptive,omitempty"`
 }
 
 type baseProvider struct {
@@ -58,6 +60,9 @@ func (bp *baseProvider) Name() string {
 func (bp *baseProvider) Version() uint32 {
 	bp.mutex.RLock()
 	defer bp.mutex.RUnlock()
+	if bp.healthCheck.adaptive != nil {
+		return bp.version + bp.healthCheck.adaptive.revision.Load()
+	}
 	return bp.version
 }
 
@@ -79,6 +84,9 @@ func (bp *baseProvider) Type() P.ProviderType {
 func (bp *baseProvider) Proxies() []C.Proxy {
 	bp.mutex.RLock()
 	defer bp.mutex.RUnlock()
+	if bp.healthCheck.adaptive != nil {
+		return bp.healthCheck.adaptive.order(bp.proxies)
+	}
 	return bp.proxies
 }
 
@@ -98,6 +106,35 @@ func (bp *baseProvider) HealthCheckURL() string {
 
 func (bp *baseProvider) RegisterHealthCheckTask(url string, expectedStatus utils.IntRanges[uint16], filter string, interval uint) {
 	bp.healthCheck.registerHealthCheckTask(url, expectedStatus, filter, interval)
+}
+
+// AdaptiveProxyAlive lets fallback use real GET results without changing the
+// meaning of ordinary URL-test/latency history used by other consumers.
+func (bp *baseProvider) AdaptiveProxyAlive(p C.Proxy) (alive, managed bool) {
+	if bp.healthCheck.adaptive == nil {
+		return false, false
+	}
+	if bp.healthCheck.adaptive.managed(p) {
+		return bp.healthCheck.adaptive.alive(p), true
+	}
+	return false, false
+}
+func (bp *baseProvider) adaptiveSnapshot() *AdaptiveSnapshot {
+	if bp.healthCheck.adaptive == nil {
+		return nil
+	}
+	return bp.healthCheck.adaptive.snapshot()
+}
+
+// TestAdaptiveProxy is used by a manual fallback selection. It refreshes real
+// reachability instead of letting an unrelated HEAD result override it.
+func (bp *baseProvider) TestAdaptiveProxy(ctx context.Context, p C.Proxy) bool {
+	_, managed := bp.AdaptiveProxyAlive(p)
+	if !managed {
+		return false
+	}
+	bp.healthCheck.adaptive.testProxy(ctx, p)
+	return true
 }
 
 func (bp *baseProvider) setProxies(proxies []C.Proxy) {
@@ -134,6 +171,7 @@ func (pp *proxySetProvider) MarshalJSON() ([]byte, error) {
 		VehicleType:      pp.VehicleType().String(),
 		Proxies:          pp.Proxies(),
 		TestUrl:          pp.healthCheck.url,
+		Adaptive:         pp.adaptiveSnapshot(),
 		ExpectedStatus:   pp.healthCheck.expectedStatus.String(),
 		UpdatedAt:        pp.UpdatedAt(),
 		SubscriptionInfo: pp.subscriptionInfo,
@@ -243,6 +281,7 @@ func (ip *inlineProvider) MarshalJSON() ([]byte, error) {
 		VehicleType:    ip.VehicleType().String(),
 		Proxies:        ip.Proxies(),
 		TestUrl:        ip.healthCheck.url,
+		Adaptive:       ip.adaptiveSnapshot(),
 		ExpectedStatus: ip.healthCheck.expectedStatus.String(),
 		UpdatedAt:      ip.updateAt,
 	})
@@ -305,6 +344,7 @@ func (cp *compatibleProvider) MarshalJSON() ([]byte, error) {
 		VehicleType:    cp.VehicleType().String(),
 		Proxies:        cp.Proxies(),
 		TestUrl:        cp.healthCheck.url,
+		Adaptive:       cp.adaptiveSnapshot(),
 		ExpectedStatus: cp.healthCheck.expectedStatus.String(),
 	})
 }
