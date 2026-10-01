@@ -947,6 +947,9 @@ func parseProxies(cfg *RawConfig) (proxies map[string]C.Proxy, providersMap map[
 
 	slices.Sort(AllProxies)
 	slices.Sort(AllProviders)
+	if err := provider.ResolveAdaptiveDependencies(providersMap); err != nil {
+		return nil, nil, err
+	}
 
 	// parse proxy group
 	for idx, mapping := range groupsConfig {

@@ -202,6 +202,14 @@ func (hc *HealthCheck) execute(b *errgroup.Group, proxies []C.Proxy, url, uid st
 
 		p := proxy
 		b.Go(func() error {
+			if hc.adaptive != nil && hc.adaptive.options.DependsOn != "" {
+				hc.adaptive.mu.RLock()
+				mode := hc.adaptive.mode
+				hc.adaptive.mu.RUnlock()
+				if !hc.adaptive.dependencyAllows(p, mode) {
+					return nil
+				}
+			}
 			ctx, cancel := context.WithTimeout(hc.ctx, hc.timeout)
 			defer cancel()
 			log.Debugln("Health Checking, proxy: %s, url: %s, id: {%s}", p.Name(), url, uid)

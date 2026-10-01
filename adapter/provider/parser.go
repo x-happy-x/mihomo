@@ -56,6 +56,9 @@ func ParseProxyProvider(name string, mapping map[string]any, tunnel C.Tunnel) (P
 	if err := decoder.Decode(mapping, schema); err != nil {
 		return nil, err
 	}
+	if schema.HealthCheck.Adaptive.DependsOn != "" && !schema.HealthCheck.Adaptive.Enable {
+		return nil, fmt.Errorf("adaptive depends-on requires adaptive.enable")
+	}
 
 	expectedStatus, err := utils.NewUnsignedRanges[uint16](schema.HealthCheck.ExpectedStatus)
 	if err != nil {
